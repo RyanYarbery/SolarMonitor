@@ -1,0 +1,50 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Solar databases / historical data
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Runtime state
+*.pid
+*.sock
+*.tmp
+runtime/
+
+# Logs
+*.log
+logs/
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+credentials.json
+secrets.json
+config.private.json
+
+# Keys / certificates
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+
+# Backups
+*.bak
+*.backup
+*.old
+
+# Editors / OS junk
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
