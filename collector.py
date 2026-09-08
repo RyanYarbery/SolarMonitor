@@ -6,6 +6,7 @@ import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
+from eg4 import get_all_parallel_status
 
 DB_PATH = Path("solar_v1.db")
 LIVE_PATH = Path("/run/solar-monitor/latest.json")
@@ -116,16 +117,119 @@ def get_mock_inverter_readings():
     return readings
 
 
+
+def get_real_inverter_readings():
+    statuses = get_all_parallel_status()
+    readings = []
+
+    for inverter_id, status in enumerate(statuses, start=1):
+        pv1_watts = (
+            status["pv1_voltage"]
+            * status["pv1_current"]
+        )
+
+        pv2_watts = (
+            status["pv2_voltage"]
+            * status["pv2_current"]
+        )
+
+        pv_watts = pv1_watts + pv2_watts
+
+        pv_current = (
+            status["pv1_current"]
+            + status["pv2_current"]
+        )
+
+        active_pv_voltages = []
+
+        if status["pv1_current"] > 0:
+            active_pv_voltages.append(
+                status["pv1_voltage"]
+            )
+
+        if status["pv2_current"] > 0:
+            active_pv_voltages.append(
+                status["pv2_voltage"]
+            )
+
+        if active_pv_voltages:
+            pv_voltage = (
+                sum(active_pv_voltages)
+                / len(active_pv_voltages)
+            )
+        else:
+            pv_voltage = max(
+                status["pv1_voltage"],
+                status["pv2_voltage"],
+            )
+
+        readings.append(
+            {
+                "inverter_id": inverter_id,
+                "grid_voltage": status["grid_voltage"],
+                "grid_frequency": status["grid_frequency"],
+                "output_voltage": status["output_voltage"],
+                "output_frequency": status["output_frequency"],
+                "output_va": status["output_va"],
+                "output_watts": status["output_watts"],
+                "load_percent": status["load_percent"],
+                "battery_voltage": status["battery_voltage"],
+                "battery_charge_amps": (
+                    status["battery_charge_current"]
+                ),
+                "battery_discharge_amps": (
+                    status["battery_discharge_current"]
+                ),
+                "battery_soc": status["battery_soc"],
+
+                # QPGS does not expose an individual
+                # inverter temperature on this firmware.
+                "inverter_temperature_c": None,
+
+                "pv_voltage": pv_voltage,
+                "pv_current": pv_current,
+
+                # QPGS PV current is low-resolution, so this
+                # is currently an estimated PV power value.
+                "pv_watts": pv_watts,
+
+                "reported_total_output_watts": (
+                    status["total_output_watts"]
+                ),
+
+                "status": (
+                    f"eg4_serial_parallel:{status['mode']}"
+                ),
+            }
+        )
+
+    return readings
+
 def build_system_sample(inverters):
     total_pv = sum(
         i["pv_watts"]
         for i in inverters
     )
 
-    total_load = sum(
-        i["output_watts"]
+    # Each QPGS response contains the parallel system's
+    # combined output. Because QPGS0/QPGS1 are queried
+    # sequentially, average their reported totals.
+    reported_loads = [
+        i["reported_total_output_watts"]
         for i in inverters
-    )
+        if i.get("reported_total_output_watts") is not None
+    ]
+
+    if reported_loads:
+        total_load = (
+            sum(reported_loads)
+            / len(reported_loads)
+        )
+    else:
+        total_load = sum(
+            i["output_watts"]
+            for i in inverters
+        )
 
     battery_voltage = (
         sum(
@@ -155,6 +259,17 @@ def build_system_sample(inverters):
         for i in inverters
     )
 
+    # We can assert zero grid power when neither inverter
+    # sees AC input. When grid is present, QPGS does not
+    # provide a trustworthy grid-watt value.
+    if all(
+        i["grid_voltage"] < 1.0
+        for i in inverters
+    ):
+        grid_watts = 0.0
+    else:
+        grid_watts = 0.0
+
     return {
         "total_pv_watts": total_pv,
         "total_load_watts": total_load,
@@ -164,11 +279,10 @@ def build_system_sample(inverters):
             total_charge_watts
             - total_discharge_watts
         ),
-        "grid_watts": 0.0,
+        "grid_watts": grid_watts,
         "inverter_count": len(inverters),
-        "source": "mock",
+        "source": "eg4_serial_parallel",
     }
-
 
 def insert_inverter_samples(
     conn,
@@ -217,9 +331,13 @@ def insert_inverter_samples(
                 round(i["battery_charge_amps"], 2),
                 round(i["battery_discharge_amps"], 2),
                 round(i["battery_soc"], 1),
-                round(
-                    i["inverter_temperature_c"],
-                    1,
+                (
+                    round(
+                        i["inverter_temperature_c"],
+                        1,
+                    )
+                    if i["inverter_temperature_c"] is not None
+                    else None
                 ),
                 round(i["pv_voltage"], 1),
                 round(i["pv_current"], 2),
@@ -346,7 +464,7 @@ def main():
         "EG4 solar collector v2 started."
     )
     print("Database:", DB_PATH)
-    print("Mode: MOCK")
+    print("Mode: EG4 SERIAL PARALLEL")
     print(
         f"Sampling every "
         f"{SAMPLE_INTERVAL} seconds."
@@ -360,9 +478,17 @@ def main():
                 )
             )
 
-            inverter_readings = (
-                get_mock_inverter_readings()
-            )
+            try:
+                inverter_readings = (
+                    get_real_inverter_readings()
+                )
+            except Exception as exc:
+                print(
+                    f"EG4 parallel read failed: {exc}",
+                    flush=True,
+                )
+                time.sleep(SAMPLE_INTERVAL)
+                continue
 
             system_sample = (
                 build_system_sample(
