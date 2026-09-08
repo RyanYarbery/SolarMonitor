@@ -42,6 +42,41 @@ def get_latest_reading():
     return dict(row) if row else None
 
 
+def get_latest_inverters():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+
+    rows = conn.execute("""
+        SELECT
+            s.timestamp,
+            s.inverter_id,
+            s.output_voltage,
+            s.output_frequency,
+            s.output_watts,
+            s.output_va,
+            s.load_percent,
+            s.battery_voltage,
+            s.battery_soc,
+            s.pv_voltage,
+            s.pv_current,
+            s.pv_watts,
+            s.status
+        FROM inverter_samples AS s
+        INNER JOIN (
+            SELECT
+                inverter_id,
+                MAX(id) AS max_id
+            FROM inverter_samples
+            GROUP BY inverter_id
+        ) AS latest
+            ON s.id = latest.max_id
+        ORDER BY s.inverter_id
+    """).fetchall()
+
+    conn.close()
+    return [dict(row) for row in rows]
+
+
 def get_recent_readings(limit=60):
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -113,6 +148,18 @@ HTML = """
             margin-bottom: 20px;
             color: #aaa;
         }
+
+        .section-title {
+            margin-top: 30px;
+            margin-bottom: 12px;
+            font-size: 22px;
+        }
+
+        .small-value {
+            font-size: 22px;
+            font-weight: bold;
+            margin-top: 8px;
+        }
     </style>
 </head>
 
@@ -156,7 +203,132 @@ HTML = """
 
 </div>
 
+<h2 class="section-title">Inverter 1</h2>
+
+<div class="grid">
+    <div class="card">
+        <div class="label">Output Power</div>
+        <div class="small-value" id="inv1Output">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Load</div>
+        <div class="small-value" id="inv1Load">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">PV Power</div>
+        <div class="small-value" id="inv1Pv">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">PV Voltage</div>
+        <div class="small-value" id="inv1PvVoltage">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Output Voltage</div>
+        <div class="small-value" id="inv1Voltage">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Battery Voltage</div>
+        <div class="small-value" id="inv1Battery">--</div>
+    </div>
+</div>
+
+<h2 class="section-title">Inverter 2</h2>
+
+<div class="grid">
+    <div class="card">
+        <div class="label">Output Power</div>
+        <div class="small-value" id="inv2Output">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Load</div>
+        <div class="small-value" id="inv2Load">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">PV Power</div>
+        <div class="small-value" id="inv2Pv">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">PV Voltage</div>
+        <div class="small-value" id="inv2PvVoltage">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Output Voltage</div>
+        <div class="small-value" id="inv2Voltage">--</div>
+    </div>
+
+    <div class="card">
+        <div class="label">Battery Voltage</div>
+        <div class="small-value" id="inv2Battery">--</div>
+    </div>
+</div>
+
 <script>
+
+async function updateInverters() {
+    try {
+        const response = await fetch("/api/inverters");
+
+        if (!response.ok) {
+            throw new Error("HTTP " + response.status);
+        }
+
+        const inverters = await response.json();
+
+        for (const inverter of inverters) {
+            const prefix = "inv" + inverter.inverter_id;
+
+            const setText = (suffix, value) => {
+                const element = document.getElementById(prefix + suffix);
+                if (element) {
+                    element.textContent = value;
+                }
+            };
+
+            setText(
+                "Output",
+                Number(inverter.output_watts).toFixed(0) + " W"
+            );
+
+            setText(
+                "Load",
+                Number(inverter.load_percent).toFixed(0) + "%"
+            );
+
+            setText(
+                "Pv",
+                Number(inverter.pv_watts).toFixed(0) + " W"
+            );
+
+            setText(
+                "PvVoltage",
+                Number(inverter.pv_voltage).toFixed(1) + " V"
+            );
+
+            setText(
+                "Voltage",
+                Number(inverter.output_voltage).toFixed(1) + " V"
+            );
+
+            setText(
+                "Battery",
+                Number(inverter.battery_voltage).toFixed(1) + " V"
+            );
+        }
+    }
+    catch (error) {
+        console.error("Error loading inverter data:", error);
+    }
+}
+
 
 async function updateDashboard() {
 
@@ -200,8 +372,10 @@ async function updateDashboard() {
 }
 
 updateDashboard();
+updateInverters();
 
-setInterval(updateDashboard, 5000);
+setInterval(updateDashboard, 10000);
+setInterval(updateInverters, 10000);
 
 </script>
 
@@ -224,6 +398,11 @@ def api_latest():
         return jsonify({"error": "No readings available"}), 404
 
     return jsonify(reading)
+
+
+@app.route("/api/inverters")
+def api_inverters():
+    return jsonify(get_latest_inverters())
 
 
 @app.route("/api/history")
