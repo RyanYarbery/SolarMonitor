@@ -48,3 +48,7 @@ config.private.json
 *~
 .DS_Store
 Thumbs.db
+
+# Local safety backups
+*.before-*
+.before-*

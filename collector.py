@@ -6,19 +6,20 @@ import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
-from eg4 import get_all_parallel_status
+from eg4 import get_all_parallel_status, get_status, get_pv2_status
 
 DB_PATH = Path("solar_v1.db")
 LIVE_PATH = Path("/run/solar-monitor/latest.json")
 
-SAMPLE_INTERVAL = 5
-COMMIT_EVERY = 12
+SAMPLE_INTERVAL = 10
+
 
 
 def connect_db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
     return conn
 
 
@@ -119,21 +120,39 @@ def get_mock_inverter_readings():
 
 
 def get_real_inverter_readings():
+    # QPGS0/QPGS1 expose both parallel inverters.
     statuses = get_all_parallel_status()
+
+    # The serial cable is physically attached to QPGS index 0.
+    # QPIGS gives direct PV1 charging power and QPIGS2 gives
+    # direct PV2 charging power for this inverter.
+    direct_status = get_status()
+    direct_pv2 = get_pv2_status()
+
+    direct_pv_watts = (
+        direct_status["pv_charging_power"]
+        + direct_pv2["pv2_watts"]
+    )
+
     readings = []
 
-    for inverter_id, status in enumerate(statuses, start=1):
-        pv1_watts = (
+    for inverter_index, status in enumerate(statuses):
+        inverter_id = inverter_index + 1
+
+        pv1_estimated_watts = (
             status["pv1_voltage"]
             * status["pv1_current"]
         )
 
-        pv2_watts = (
+        pv2_estimated_watts = (
             status["pv2_voltage"]
             * status["pv2_current"]
         )
 
-        pv_watts = pv1_watts + pv2_watts
+        estimated_pv_watts = (
+            pv1_estimated_watts
+            + pv2_estimated_watts
+        )
 
         pv_current = (
             status["pv1_current"]
@@ -163,6 +182,13 @@ def get_real_inverter_readings():
                 status["pv2_voltage"],
             )
 
+        if inverter_index == 0:
+            pv_watts = direct_pv_watts
+            pv_quality = "measured"
+        else:
+            pv_watts = estimated_pv_watts
+            pv_quality = "estimated"
+
         readings.append(
             {
                 "inverter_id": inverter_id,
@@ -181,29 +207,23 @@ def get_real_inverter_readings():
                     status["battery_discharge_current"]
                 ),
                 "battery_soc": status["battery_soc"],
-
-                # QPGS does not expose an individual
-                # inverter temperature on this firmware.
                 "inverter_temperature_c": None,
-
                 "pv_voltage": pv_voltage,
                 "pv_current": pv_current,
-
-                # QPGS PV current is low-resolution, so this
-                # is currently an estimated PV power value.
                 "pv_watts": pv_watts,
-
                 "reported_total_output_watts": (
                     status["total_output_watts"]
                 ),
-
                 "status": (
-                    f"eg4_serial_parallel:{status['mode']}"
+                    f"eg4_serial_parallel:"
+                    f"{status['mode']}:"
+                    f"pv_{pv_quality}"
                 ),
             }
         )
 
     return readings
+
 
 def build_system_sample(inverters):
     total_pv = sum(
@@ -458,7 +478,6 @@ def main():
         )
 
     conn = connect_db()
-    pending_samples = 0
 
     print(
         "EG4 solar collector v2 started."
@@ -496,31 +515,37 @@ def main():
                 )
             )
 
-            insert_inverter_samples(
-                conn,
-                timestamp,
-                inverter_readings,
-            )
+            try:
+                # Keep the two inverter rows and the system row
+                # atomic, but release SQLite's writer lock
+                # immediately after this telemetry sample.
+                with conn:
+                    insert_inverter_samples(
+                        conn,
+                        timestamp,
+                        inverter_readings,
+                    )
 
-            insert_system_sample(
-                conn,
-                timestamp,
-                system_sample,
-            )
+                    insert_system_sample(
+                        conn,
+                        timestamp,
+                        system_sample,
+                    )
 
+            except sqlite3.OperationalError as exc:
+                print(
+                    f"Database write failed: {exc}",
+                    flush=True,
+                )
+                time.sleep(SAMPLE_INTERVAL)
+                continue
+
+            # Publish live state only after the database
+            # transaction committed successfully.
             write_live_sample(
                 timestamp,
                 system_sample,
             )
-
-            pending_samples += 1
-
-            if (
-                pending_samples
-                >= COMMIT_EVERY
-            ):
-                conn.commit()
-                pending_samples = 0
 
             print(
                 f"{timestamp} | "
@@ -545,7 +570,6 @@ def main():
         )
 
     finally:
-        conn.commit()
         conn.close()
         print(
             "Database connection closed."

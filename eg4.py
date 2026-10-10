@@ -52,6 +52,29 @@ def query(command: str) -> str:
     return payload.decode("ascii")
 
 
+
+def get_pv2_status():
+    response = query("QPIGS2")
+
+    if not response.startswith("("):
+        raise ValueError(
+            f"Unexpected QPIGS2 response: {response}"
+        )
+
+    fields = response[1:].split()
+
+    if len(fields) < 3:
+        raise ValueError(
+            f"Unexpected QPIGS2 field count: "
+            f"{len(fields)}: {fields}"
+        )
+
+    return {
+        "pv2_current": float(fields[0]),
+        "pv2_voltage": float(fields[1]),
+        "pv2_watts": int(fields[2]),
+    }
+
 def get_mode():
     response = query("QMOD")
 
