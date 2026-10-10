@@ -172,3 +172,53 @@ Future improvements may include richer diagnostics, better fault interpretation,
 ## License
 
 No license has been selected yet.
+
+## Installation
+
+Clone the repository:
+
+```bash
+git clone https://github.com/RyanYarbery/SolarMonitor.git
+cd SolarMonitor
+```
+
+Create a Python virtual environment and install dependencies:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Initialize the database using the repository's database initialization script before starting the services.
+
+The example systemd units under `systemd/` assume:
+
+```text
+Application directory: /opt/solar-monitor
+Service account:       solar
+```
+
+Adjust those values for your environment before installing the units.
+
+Example installation:
+
+```bash
+sudo cp systemd/*.service /etc/systemd/system/
+sudo cp systemd/*.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+
+sudo systemctl enable --now solar-collector.service
+sudo systemctl enable --now solar-dashboard.service
+sudo systemctl enable --now solar-aggregator.timer
+```
+
+Check service status with:
+
+```bash
+systemctl status solar-collector.service
+systemctl status solar-dashboard.service
+systemctl status solar-aggregator.timer
+```
+
+The dashboard listens on port `5000` by default.
