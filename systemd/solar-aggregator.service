@@ -1,0 +1,11 @@
+[Unit]
+Description=Solar Telemetry Aggregator
+After=solar-collector.service
+RequiresMountsFor=/opt/solar-monitor
+
+[Service]
+Type=oneshot
+User=solar
+WorkingDirectory=/opt/solar-monitor
+ExecStart=/opt/solar-monitor/.venv/bin/python /opt/solar-monitor/aggregator.py
+TimeoutStartSec=4min

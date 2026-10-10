@@ -1,0 +1,15 @@
+[Unit]
+Description=EG4 Solar Dashboard
+After=network.target solar-collector.service
+RequiresMountsFor=/opt/solar-monitor
+
+[Service]
+Type=simple
+User=solar
+WorkingDirectory=/opt/solar-monitor
+ExecStart=/opt/solar-monitor/.venv/bin/python /opt/solar-monitor/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

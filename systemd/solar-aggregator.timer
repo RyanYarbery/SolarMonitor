@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Solar Telemetry Aggregator Every 5 Minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+Unit=solar-aggregator.service
+
+[Install]
+WantedBy=timers.target
