@@ -101,3 +101,28 @@ def clear_alert(conn, key, title=None, message=None, tags=("white_check_mark",))
 
 def dumps(obj) -> str:
     return json.dumps(obj, indent=2, sort_keys=True)
+
+
+def main(argv):
+    """python alerts.py --test   sends a test notification to SOLAR_NTFY_URL."""
+    if argv[:1] != ["--test"]:
+        print(main.__doc__)
+        return 2
+    if not enabled():
+        print("SOLAR_NTFY_URL is not set; nothing sent.")
+        return 1
+    ok = send(
+        "Solar Monitor test",
+        "If you can read this, alerts work.",
+        "info",
+        ("sunny",),
+        background=False,
+    )
+    print("sent" if ok else "failed", "->", settings.NTFY_URL)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main(sys.argv[1:]))

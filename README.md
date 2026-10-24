@@ -80,9 +80,14 @@ Grid power is not reported by `QPGS` in a trustworthy form, so `grid_watts` is s
 
 ### Events and alerts
 
-Mode changes and fault code transitions per inverter are written to the `events` table, as are telemetry loss (after six consecutive failed reads), recovery, and battery SOC dropping below `low_soc_alert_percent` (clearing with 5% hysteresis). The dashboard shows the most recent events and a banner when any inverter reports a fault.
+Mode changes and fault code transitions per inverter are written to the `events` table, as are telemetry loss (after six consecutive failed reads), recovery, battery SOC dropping below `low_soc_alert_percent` (clearing with 5% hysteresis), and utility or generator AC appearing at the inverter input (at or above 100 V) or disappearing (below 80 V). The dashboard shows the most recent events and a banner when any inverter reports a fault.
 
-Set `SOLAR_NTFY_URL` to a topic such as `https://ntfy.sh/your-unguessable-topic` and the same conditions are pushed to your phone through the free [ntfy](https://ntfy.sh) app. Each alert key has a cooldown (default 30 minutes) tracked in the `alert_state` table, and a recovery message is sent when the condition clears. The aggregator, which runs from a timer, additionally alerts when the newest sample is older than `SOLAR_STALE_ALERT_AFTER` seconds, since a dead collector cannot report itself.
+Set `SOLAR_NTFY_URL` to a topic such as `https://ntfy.sh/your-unguessable-topic` and the same conditions are pushed to your phone through the free [ntfy](https://ntfy.sh) app. To set it up: install the ntfy app, subscribe to a topic name nobody would guess, put the same URL in `/etc/solar-monitor.env`, restart the collector, and confirm with:
+
+```bash
+set -a; source /etc/solar-monitor.env; set +a
+python alerts.py --test
+``` Each alert key has a cooldown (default 30 minutes) tracked in the `alert_state` table, and a recovery message is sent when the condition clears. The aggregator, which runs from a timer, additionally alerts when the newest sample is older than `SOLAR_STALE_ALERT_AFTER` seconds, since a dead collector cannot report itself.
 
 ### Watchdog
 
@@ -195,6 +200,7 @@ Operational settings are environment variables, read by `settings.py`. The syste
 | `SOLAR_NTFY_TOKEN` | empty | Bearer token for a protected topic |
 | `SOLAR_ALERT_COOLDOWN` | `1800` | Seconds between repeats of the same alert |
 | `SOLAR_STALE_ALERT_AFTER` | `600` | Aggregator alerts when newest sample is older |
+| `SOLAR_GRID_ON_VOLTS` / `OFF_VOLTS` | `100` / `80` | AC input present/absent thresholds |
 | `SOLAR_BACKUP_DIR` | `backups` | Put this on a different device |
 | `SOLAR_BACKUP_KEEP` | `14` | Backups to retain |
 | `SOLAR_BACKUP_COMMAND` | empty | Shell command run after a backup, `{path}` substituted |

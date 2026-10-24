@@ -9,6 +9,7 @@ def inv(inverter_id, mode="B", fault="00", **kw):
         "inverter_id": inverter_id,
         "pv_watts": 1000.0,
         "output_watts": 400.0,
+        "grid_voltage": 0.0,
         "battery_voltage": 52.0,
         "battery_soc": 80.0,
         "battery_charge_amps": 10.0,
@@ -134,6 +135,28 @@ class CollectorCycleTests(unittest.TestCase):
         self.assertEqual(data["inverters"][1]["pv_quality"], "estimated")
         self.assertFalse(data["any_fault"])
         settings.LIVE_PATH = settings.LIVE_PATH  # untouched
+
+
+class GridTrackerTests(unittest.TestCase):
+    def test_initial_state_is_silent_then_transitions(self):
+        t = collector.GridTracker(on_volts=100, off_volts=80)
+        self.assertIsNone(t.update(0.0))  # learns "absent"
+        self.assertFalse(t.present)
+        self.assertIsNone(t.update(50.0))  # noise below threshold
+        self.assertEqual(t.update(118.0), "on")
+        self.assertIsNone(t.update(90.0))  # sagging but still on (hysteresis)
+        self.assertEqual(t.update(0.0), "off")
+        self.assertIsNone(t.update(None))
+
+    def test_starts_present_when_grid_already_on(self):
+        t = collector.GridTracker()
+        self.assertIsNone(t.update(120.0))
+        self.assertTrue(t.present)
+        self.assertEqual(t.update(0.0), "off")
+
+    def test_system_sample_carries_grid_voltage(self):
+        s = collector.build_system_sample([inv(1, grid_voltage=0.0), inv(2, grid_voltage=119.5)])
+        self.assertEqual(s["grid_voltage"], 119.5)
 
 
 class LowSocTrackerTests(unittest.TestCase):

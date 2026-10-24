@@ -488,6 +488,8 @@ HTML = r"""<!DOCTYPE html>
        <div class="quality-label">+ charging / - discharging</div></div>
   <div class="card"><div class="label">Battery Runtime</div><div class="value" id="runtime">--</div>
        <div class="quality-label" id="runtimeLabel">set battery_capacity_kwh to enable</div></div>
+  <div class="card"><div class="label">Utility / AC Input</div><div class="value" id="grid">--</div>
+       <div class="quality-label" id="gridLabel"></div></div>
 </div>
 
 <h2 class="section-title">Energy</h2>
@@ -553,6 +555,13 @@ async function updateDashboard() {
     document.getElementById("batterySoc").textContent = fmt(d.battery_soc, 0, "%");
     document.getElementById("batteryVoltage").textContent = fmt(d.battery_voltage, 1, " V");
     document.getElementById("batteryWatts").textContent = fmt(d.battery_watts, 0, " W");
+    if (d.grid_present === true) {
+      document.getElementById("grid").textContent = "On";
+      document.getElementById("gridLabel").textContent = fmt(d.grid_voltage, 0, " V") + " at the input";
+    } else if (d.grid_present === false) {
+      document.getElementById("grid").textContent = "Off";
+      document.getElementById("gridLabel").textContent = "running on solar and battery";
+    }
     document.getElementById("status").textContent =
       "Last update: " + localTime(d.timestamp) + " | " + d.inverter_count + " inverters | " + d.source;
     banner.className = "banner";

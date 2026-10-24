@@ -56,6 +56,26 @@ class AlertDisabledTests(unittest.TestCase):
             settings.NTFY_URL = old
 
 
+class AlertCliTests(unittest.TestCase):
+    def test_test_flag_sends_when_enabled(self):
+        old = settings.NTFY_URL
+        settings.NTFY_URL = "https://ntfy.example/t"
+        try:
+            with mock.patch.object(alerts, "_post", return_value=True) as post:
+                self.assertEqual(alerts.main(["--test"]), 0)
+                post.assert_called_once()
+        finally:
+            settings.NTFY_URL = old
+
+    def test_test_flag_disabled(self):
+        old = settings.NTFY_URL
+        settings.NTFY_URL = ""
+        try:
+            self.assertEqual(alerts.main(["--test"]), 1)
+        finally:
+            settings.NTFY_URL = old
+
+
 class SdNotifyTests(unittest.TestCase):
     def test_noop_without_socket(self):
         with mock.patch.dict(os.environ, {}, clear=False):

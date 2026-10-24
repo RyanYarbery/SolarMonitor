@@ -54,6 +54,10 @@ ALERT_COOLDOWN = _env("SOLAR_ALERT_COOLDOWN", 1800, int)
 # Hysteresis above low_soc_alert_percent before the low-SOC alert clears.
 LOW_SOC_CLEAR_MARGIN = _env("SOLAR_LOW_SOC_CLEAR_MARGIN", 5.0, float)
 
+# Utility/generator AC input detection on a 120 V system (hysteresis).
+GRID_ON_VOLTS = _env("SOLAR_GRID_ON_VOLTS", 100.0, float)
+GRID_OFF_VOLTS = _env("SOLAR_GRID_OFF_VOLTS", 80.0, float)
+
 # Backups
 BACKUP_DIR = Path(_env("SOLAR_BACKUP_DIR", "backups"))
 BACKUP_KEEP = _env("SOLAR_BACKUP_KEEP", 14, int)

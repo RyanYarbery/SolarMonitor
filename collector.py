@@ -129,9 +129,12 @@ def build_system_sample(inverters):
     charge_w = sum(i["battery_charge_amps"] * i["battery_voltage"] for i in inverters)
     discharge_w = sum(i["battery_discharge_amps"] * i["battery_voltage"] for i in inverters)
 
+    grid_voltage = max(i["grid_voltage"] for i in inverters)
+
     return {
         "total_pv_watts": total_pv,
         "total_load_watts": total_load,
+        "grid_voltage": grid_voltage,
         "battery_voltage": battery_voltage,
         "battery_soc": battery_soc,
         "battery_watts": charge_w - discharge_w,
@@ -295,6 +298,34 @@ class LowSocTracker:
         return None
 
 
+class GridTracker:
+    """Detects utility/generator AC appearing at or disappearing from the input.
+
+    Hysteresis: present at or above GRID_ON_VOLTS, absent below GRID_OFF_VOLTS.
+    The first cycle only records the initial state and emits nothing.
+    """
+
+    def __init__(self, on_volts=settings.GRID_ON_VOLTS, off_volts=settings.GRID_OFF_VOLTS):
+        self.on_volts = on_volts
+        self.off_volts = off_volts
+        self.present = None
+
+    def update(self, grid_voltage):
+        """Return 'on', 'off' or None."""
+        if grid_voltage is None:
+            return None
+        if self.present is None:
+            self.present = grid_voltage >= self.on_volts
+            return None
+        if not self.present and grid_voltage >= self.on_volts:
+            self.present = True
+            return "on"
+        if self.present and grid_voltage < self.off_volts:
+            self.present = False
+            return "off"
+        return None
+
+
 def load_plant_config(conn):
     return dict(conn.execute("SELECT key, value FROM system_config").fetchall())
 
@@ -325,6 +356,14 @@ def dispatch_alert(conn, event_type, message, severity, inverter_id=None):
             )
         elif event_type == "telemetry_restored":
             alerts.clear_alert(conn, "telemetry_lost", "Inverter telemetry restored", message)
+        elif event_type == "grid_on":
+            alerts.raise_alert(
+                conn, "grid_present", "Utility power on", message, "warning", ("electric_plug",)
+            )
+        elif event_type == "grid_off":
+            alerts.clear_alert(
+                conn, "grid_present", "Utility power off", message, ("electric_plug",)
+            )
         elif event_type == "low_soc":
             alerts.raise_alert(conn, "low_soc", "Battery low", message, "warning", ("battery",))
         elif event_type == "soc_recovered":
@@ -361,6 +400,8 @@ class LiveWriter:
             "battery_soc": _r(sample["battery_soc"], 1),
             "battery_watts": _r(sample["battery_watts"], 1),
             "grid_watts": _r(sample["grid_watts"], 1),
+            "grid_voltage": _r(sample["grid_voltage"], 1),
+            "grid_present": sample.get("grid_present"),
             "inverter_count": sample["inverter_count"],
             "source": sample["source"],
             "any_fault": sample["any_fault"],
@@ -400,6 +441,7 @@ def main():
     tracker = StateTracker()
     plant = load_plant_config(conn)
     soc_tracker = LowSocTracker(float(plant.get("low_soc_alert_percent") or 20))
+    grid_tracker = GridTracker()
     failures = 0
     lost_reported = False
     cycles = 0
@@ -463,6 +505,20 @@ def main():
 
             system = build_system_sample(inverters)
             pending_events.extend(tracker.events_for(inverters))
+
+            grid_change = grid_tracker.update(system["grid_voltage"])
+            if grid_change == "on":
+                pending_events.append(
+                    (
+                        "grid_on",
+                        f"AC input detected at {system['grid_voltage']:.0f} V",
+                        "warning",
+                        None,
+                    )
+                )
+            elif grid_change == "off":
+                pending_events.append(("grid_off", "AC input lost", "info", None))
+            system["grid_present"] = grid_tracker.present
 
             soc_change = soc_tracker.update(system["battery_soc"])
             if soc_change == "low":
