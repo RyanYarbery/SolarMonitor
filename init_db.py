@@ -1,7 +1,8 @@
 import sqlite3
-from pathlib import Path
 
-DB_PATH = Path("solar_v1.db")
+import settings
+
+DB_PATH = settings.DB_PATH
 
 
 SCHEMA = """
@@ -41,6 +42,8 @@ CREATE TABLE IF NOT EXISTS inverter_samples (
     pv_current REAL,
     pv_watts REAL,
 
+    mode TEXT,
+    fault_code TEXT,
     status TEXT,
 
     UNIQUE(timestamp, inverter_id)
@@ -240,6 +243,34 @@ CREATE TABLE IF NOT EXISTS daily_summary (
 );
 
 
+CREATE TABLE IF NOT EXISTS daily_inverter_summary (
+    date TEXT NOT NULL,
+    inverter_id INTEGER NOT NULL,
+
+    pv_energy_wh REAL,
+    load_energy_wh REAL,
+
+    peak_pv_watts REAL,
+    peak_pv_time TEXT,
+
+    peak_load_watts REAL,
+    peak_load_time TEXT,
+
+    peak_temperature_c REAL,
+    avg_temperature_c REAL,
+
+    fault_count INTEGER NOT NULL DEFAULT 0,
+
+    PRIMARY KEY (date, inverter_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_inverter_summary_date
+ON daily_inverter_summary(date);
+
+CREATE INDEX IF NOT EXISTS idx_daily_inverter_summary_inverter
+ON daily_inverter_summary(inverter_id, date);
+
+
 CREATE TABLE IF NOT EXISTS monthly_summary (
     month TEXT PRIMARY KEY,
 
@@ -297,13 +328,12 @@ CREATE TABLE IF NOT EXISTS yearly_summary (
 """
 
 
+SCHEMA_VERSION = "3"
+
+# Plant facts live in the database. Operational knobs (paths, serial port,
+# intervals, retention) are environment variables; see settings.py.
 DEFAULT_CONFIG = {
-    "schema_version": "1",
-    "raw_retention_days": "7",
-    "minute_retention_days": "365",
-    "quarter_hour_retention_days": "0",
-    "daily_retention_days": "0",
-    "sample_interval_seconds": "5",
+    "schema_version": SCHEMA_VERSION,
     "production_threshold_watts": "100",
     "installed_pv_kw": "0",
     "battery_capacity_kwh": "0",
@@ -341,8 +371,9 @@ def main():
         print(f"Created production database: {DB_PATH}")
     else:
         print(f"Production database already exists: {DB_PATH}")
+        print("If it predates schema v3, run migrate_v3.py.")
 
-    print("Schema version: 1")
+    print(f"Schema version: {SCHEMA_VERSION}")
 
 
 if __name__ == "__main__":
