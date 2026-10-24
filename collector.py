@@ -11,6 +11,8 @@ import sqlite3
 import time
 import traceback
 
+import alerts
+import sdnotify
 import settings
 from eg4 import EG4Serial
 from timeutil import now_utc, to_iso
@@ -63,9 +65,12 @@ def read_inverters(link):
             pv_voltage = max(status["pv1_voltage"], status["pv2_voltage"])
 
         if index == 0:
+            pv1_watts = direct_status["pv_charging_power"]
+            pv2_watts = direct_pv2["pv2_watts"]
             pv_watts, pv_quality = direct_pv_watts, "measured"
             temperature = direct_status["temperature_c"]
         else:
+            pv1_watts, pv2_watts = pv1_w, pv2_w
             pv_watts, pv_quality = pv1_w + pv2_w, "estimated"
             temperature = None
 
@@ -87,6 +92,12 @@ def read_inverters(link):
                 "pv_voltage": pv_voltage,
                 "pv_current": status["pv1_current"] + status["pv2_current"],
                 "pv_watts": pv_watts,
+                "pv1_voltage": status["pv1_voltage"],
+                "pv1_current": status["pv1_current"],
+                "pv1_watts": pv1_watts,
+                "pv2_voltage": status["pv2_voltage"],
+                "pv2_current": status["pv2_current"],
+                "pv2_watts": pv2_watts,
                 "pv_quality": pv_quality,
                 "mode": status["mode"],
                 "fault_code": status["fault_code"],
@@ -152,8 +163,10 @@ def insert_inverter_samples(conn, timestamp, inverters):
             battery_voltage, battery_charge_amps, battery_discharge_amps,
             battery_soc, inverter_temperature_c,
             pv_voltage, pv_current, pv_watts,
+            pv1_voltage, pv1_current, pv1_watts,
+            pv2_voltage, pv2_current, pv2_watts,
             mode, fault_code, status
-        ) VALUES (?,?, ?,?, ?,?,?,?, ?, ?,?,?, ?,?, ?,?,?, ?,?,?)
+        ) VALUES (?,?, ?,?, ?,?,?,?, ?, ?,?,?, ?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?)
         """,
         [
             (
@@ -174,6 +187,12 @@ def insert_inverter_samples(conn, timestamp, inverters):
                 _r(i["pv_voltage"], 1),
                 _r(i["pv_current"], 2),
                 _r(i["pv_watts"], 1),
+                _r(i["pv1_voltage"], 1),
+                _r(i["pv1_current"], 2),
+                _r(i["pv1_watts"], 1),
+                _r(i["pv2_voltage"], 1),
+                _r(i["pv2_current"], 2),
+                _r(i["pv2_watts"], 1),
                 i["mode"],
                 i["fault_code"],
                 i["status"],
@@ -255,6 +274,65 @@ class StateTracker:
         return events
 
 
+class LowSocTracker:
+    """Fires once when SOC drops below the threshold, clears with hysteresis."""
+
+    def __init__(self, threshold, clear_margin=settings.LOW_SOC_CLEAR_MARGIN):
+        self.threshold = threshold
+        self.clear_margin = clear_margin
+        self.low = False
+
+    def update(self, soc):
+        """Return 'low', 'recovered' or None."""
+        if soc is None:
+            return None
+        if not self.low and soc < self.threshold:
+            self.low = True
+            return "low"
+        if self.low and soc >= self.threshold + self.clear_margin:
+            self.low = False
+            return "recovered"
+        return None
+
+
+def load_plant_config(conn):
+    return dict(conn.execute("SELECT key, value FROM system_config").fetchall())
+
+
+def dispatch_alert(conn, event_type, message, severity, inverter_id=None):
+    """Map a recorded event onto an ntfy alert with cooldown. Never raises."""
+    try:
+        if event_type == "fault":
+            alerts.raise_alert(
+                conn,
+                f"fault:{inverter_id}",
+                f"Inverter {inverter_id} fault",
+                message,
+                "error",
+                ("rotating_light",),
+            )
+        elif event_type == "fault_cleared":
+            alerts.clear_alert(
+                conn, f"fault:{inverter_id}", f"Inverter {inverter_id} fault cleared", message
+            )
+        elif event_type == "mode_change" and severity == "warning":
+            alerts.raise_alert(
+                conn, f"mode_fault:{inverter_id}", "Inverter entered fault mode", message, "error"
+            )
+        elif event_type == "telemetry_lost":
+            alerts.raise_alert(
+                conn, "telemetry_lost", "Inverter telemetry lost", message, "warning", ("warning",)
+            )
+        elif event_type == "telemetry_restored":
+            alerts.clear_alert(conn, "telemetry_lost", "Inverter telemetry restored", message)
+        elif event_type == "low_soc":
+            alerts.raise_alert(conn, "low_soc", "Battery low", message, "warning", ("battery",))
+        elif event_type == "soc_recovered":
+            alerts.clear_alert(conn, "low_soc", "Battery recovered", message)
+    except Exception as exc:  # alerting must never take the collector down
+        print(f"Alert dispatch failed: {exc}", flush=True)
+
+
 # ------------------------------------------------------------------ live file
 
 
@@ -292,6 +370,8 @@ class LiveWriter:
                     "mode": i["mode"],
                     "fault_code": i["fault_code"],
                     "pv_watts": _r(i["pv_watts"], 1),
+                    "pv1_watts": _r(i["pv1_watts"], 1),
+                    "pv2_watts": _r(i["pv2_watts"], 1),
                     "pv_quality": i["pv_quality"],
                     "output_watts": _r(i["output_watts"], 1),
                 }
@@ -318,18 +398,31 @@ def main():
     link = EG4Serial()
     live = LiveWriter()
     tracker = StateTracker()
+    plant = load_plant_config(conn)
+    soc_tracker = LowSocTracker(float(plant.get("low_soc_alert_percent") or 20))
     failures = 0
     lost_reported = False
+    cycles = 0
 
     print("EG4 solar collector v3 started.")
     print("Database:", settings.DB_PATH)
     print("Serial:", link.port, "@", link.baud)
-    print(f"Sampling every {settings.SAMPLE_INTERVAL} seconds.", flush=True)
+    print(f"Sampling every {settings.SAMPLE_INTERVAL} seconds.")
+    print("Alerts:", settings.NTFY_URL or "disabled", flush=True)
+    sdnotify.ready()
 
     try:
         while True:
             cycle_started = time.monotonic()
             timestamp = to_iso(now_utc())
+            sdnotify.watchdog()
+            cycles += 1
+            if cycles % 60 == 0:  # pick up configure.py changes every ~10 minutes
+                try:
+                    plant = load_plant_config(conn)
+                    soc_tracker.threshold = float(plant.get("low_soc_alert_percent") or 20)
+                except sqlite3.Error:
+                    pass
 
             try:
                 inverters = read_inverters(link)
@@ -371,12 +464,33 @@ def main():
             system = build_system_sample(inverters)
             pending_events.extend(tracker.events_for(inverters))
 
+            soc_change = soc_tracker.update(system["battery_soc"])
+            if soc_change == "low":
+                pending_events.append(
+                    (
+                        "low_soc",
+                        f"Battery SOC {system['battery_soc']:.0f}% is below {soc_tracker.threshold:.0f}%",
+                        "warning",
+                        None,
+                    )
+                )
+            elif soc_change == "recovered":
+                pending_events.append(
+                    (
+                        "soc_recovered",
+                        f"Battery SOC back to {system['battery_soc']:.0f}%",
+                        "info",
+                        None,
+                    )
+                )
+
             try:
                 with conn:
                     insert_inverter_samples(conn, timestamp, inverters)
                     insert_system_sample(conn, timestamp, system)
                     for event_type, message, severity, inverter_id in pending_events:
                         record_event(conn, timestamp, event_type, message, severity, inverter_id)
+                        dispatch_alert(conn, event_type, message, severity, inverter_id)
                         print(f"EVENT {severity}: {message}", flush=True)
             except sqlite3.Error as exc:
                 print(f"Database write failed: {exc}", flush=True)
@@ -384,6 +498,10 @@ def main():
                 continue
 
             live.write(timestamp, system, inverters)
+            sdnotify.status(
+                f"PV {system['total_pv_watts']:.0f} W, load {system['total_load_watts']:.0f} W, "
+                f"SOC {system['battery_soc']:.0f}%"
+            )
 
             print(
                 f"{timestamp} | PV {system['total_pv_watts']:7.1f} W | "
