@@ -2,7 +2,6 @@ import unittest
 from datetime import timedelta
 
 import aggregator
-import settings
 from tests.helpers import cleanup_db, fresh_db
 from timeutil import local_day_bounds, now_utc, to_iso, today_local
 
@@ -59,8 +58,6 @@ class IntegrateEnergyTests(unittest.TestCase):
 class RetentionTests(unittest.TestCase):
     def setUp(self):
         self.conn, self.path = fresh_db()
-        aggregator.settings = settings
-        self.conn.row_factory = aggregator.connect_db().row_factory
 
     def tearDown(self):
         self.conn.close()
