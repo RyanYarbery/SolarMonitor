@@ -1,14 +1,17 @@
 """Flask dashboard and JSON API."""
 
+import csv
+import io
 import json
 import sqlite3
 from datetime import timedelta
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request
 
 import settings
+from aggregator import integrate_energy
 from eg4 import MODES
-from timeutil import now_utc, parse_iso, to_iso, today_local
+from timeutil import local_day_bounds, now_utc, parse_iso, to_iso, today_local
 
 app = Flask(__name__)
 
@@ -68,6 +71,8 @@ def get_latest_inverters():
             SELECT s.timestamp, s.inverter_id, s.output_voltage, s.output_frequency,
                    s.output_watts, s.output_va, s.load_percent, s.battery_voltage,
                    s.battery_soc, s.pv_voltage, s.pv_current, s.pv_watts,
+                   s.pv1_voltage, s.pv1_current, s.pv1_watts,
+                   s.pv2_voltage, s.pv2_current, s.pv2_watts,
                    s.inverter_temperature_c, s.mode, s.fault_code, s.status
             FROM inverter_samples AS s
             INNER JOIN (
@@ -109,6 +114,119 @@ def get_recent_events(limit=50):
     finally:
         conn.close()
     return [dict(r) for r in rows]
+
+
+# -------------------------------------------------------------------- summary
+
+
+def energy_today(conn):
+    """Today's PV and load energy: completed quarter-hours plus the raw tail.
+
+    Integrating a whole day of 10-second samples on every refresh is too much
+    for a Pi 1, so the roll-ups do the heavy lifting.
+    """
+    day_start, day_end = local_day_bounds(today_local())
+    row = conn.execute(
+        "SELECT SUM(pv_energy_wh), SUM(load_energy_wh), MAX(timestamp) "
+        "FROM quarter_hour_summary WHERE timestamp >= ? AND timestamp < ?",
+        (to_iso(day_start), to_iso(day_end)),
+    ).fetchone()
+    pv_wh = row[0] or 0.0
+    load_wh = row[1] or 0.0
+    # Quarter buckets are keyed by start; the tail begins at the last bucket's end.
+    tail_from = parse_iso(row[2]) + timedelta(minutes=15) if row[2] else day_start
+    tail = conn.execute(
+        "SELECT timestamp, total_pv_watts, total_load_watts FROM system_samples "
+        "WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+        (to_iso(tail_from), to_iso(day_end)),
+    ).fetchall()
+    pv_wh += integrate_energy(tail, "total_pv_watts")
+    load_wh += integrate_energy(tail, "total_load_watts")
+    return {"pv_wh": round(pv_wh), "load_wh": round(load_wh)}
+
+
+def battery_runtime(reading, capacity_kwh):
+    """Hours to empty (discharging) or to full (charging) at the current rate."""
+    if not reading or not capacity_kwh or capacity_kwh <= 0:
+        return None
+    soc = reading.get("battery_soc")
+    watts = reading.get("battery_watts")
+    if soc is None or watts is None or abs(watts) < 25:
+        return {"state": "idle", "hours": None}
+    capacity_wh = capacity_kwh * 1000.0
+    if watts < 0:
+        return {"state": "discharging", "hours": round(soc / 100.0 * capacity_wh / -watts, 1)}
+    return {"state": "charging", "hours": round((100.0 - soc) / 100.0 * capacity_wh / watts, 1)}
+
+
+def get_summary():
+    conn = connect_db()
+    try:
+        config = dict(conn.execute("SELECT key, value FROM system_config").fetchall())
+        yesterday = conn.execute(
+            "SELECT pv_energy_wh, load_energy_wh, battery_soc_min, pv_peak_watts, "
+            "insolation_wh_m2, performance_ratio FROM daily_summary WHERE date = ?",
+            ((today_local() - timedelta(days=1)).isoformat(),),
+        ).fetchone()
+        today = energy_today(conn)
+        soc_min_today = conn.execute(
+            "SELECT MIN(battery_soc) FROM system_samples WHERE timestamp >= ?",
+            (to_iso(local_day_bounds(today_local())[0]),),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    reading = get_latest_reading()
+    capacity = float(config.get("battery_capacity_kwh") or 0)
+    return {
+        "today": dict(today, battery_soc_min=soc_min_today),
+        "yesterday": dict(yesterday) if yesterday else None,
+        "battery": battery_runtime(reading, capacity),
+        "battery_capacity_kwh": capacity or None,
+        "installed_pv_kw": float(config.get("installed_pv_kw") or 0) or None,
+    }
+
+
+DAY_COLUMNS = [
+    "date",
+    "pv_energy_wh",
+    "load_energy_wh",
+    "battery_charge_wh",
+    "battery_discharge_wh",
+    "pv_peak_watts",
+    "pv_peak_time",
+    "load_peak_watts",
+    "production_minutes",
+    "battery_soc_min",
+    "battery_soc_max",
+    "battery_round_trip_efficiency",
+    "equivalent_battery_cycles",
+    "specific_yield_kwh_per_kw",
+    "insolation_wh_m2",
+    "performance_ratio",
+    "inverter_1_pv_wh",
+    "inverter_2_pv_wh",
+]
+
+
+def get_days(days=90):
+    conn = connect_db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM daily_summary WHERE date >= ? ORDER BY date DESC",
+            ((today_local() - timedelta(days=days)).isoformat(),),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [{k: r[k] for k in DAY_COLUMNS} for r in rows]
+
+
+def days_csv(rows):
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=DAY_COLUMNS)
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue()
 
 
 # -------------------------------------------------------------------- history
@@ -264,6 +382,38 @@ def api_events():
     return jsonify(get_recent_events(limit))
 
 
+@app.route("/api/summary")
+def api_summary():
+    return jsonify(get_summary())
+
+
+def _days_arg():
+    try:
+        return max(1, min(int(request.args.get("days", 90)), 3660))
+    except (TypeError, ValueError):
+        return 90
+
+
+@app.route("/api/days")
+def api_days():
+    return jsonify(get_days(_days_arg()))
+
+
+@app.route("/api/days.csv")
+def api_days_csv():
+    days = _days_arg()
+    return Response(
+        days_csv(get_days(days)),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=solar-days-{days}.csv"},
+    )
+
+
+@app.route("/days")
+def days_page():
+    return render_template_string(DAYS_HTML)
+
+
 @app.route("/api/history")
 def api_history():
     try:
@@ -319,11 +469,12 @@ HTML = r"""<!DOCTYPE html>
   table.events td { padding: 6px 8px; border-bottom: 1px solid #2a2a2a; vertical-align: top; }
   table.events td.time { color: #aaa; white-space: nowrap; }
   .sev-info { color: #9ecbff; } .sev-warning { color: #ffc966; } .sev-error { color: #ff6b6b; }
+  a.nav { font-size: 14px; font-weight: normal; margin-left: 16px; color: #9ecbff; }
 </style>
 </head>
 <body>
 
-<h1>Solar Monitor</h1>
+<h1>Solar Monitor <a class="nav" href="/days">Daily table</a></h1>
 <div class="status" id="status">Waiting for telemetry...</div>
 <div class="banner" id="banner"></div>
 
@@ -335,6 +486,20 @@ HTML = r"""<!DOCTYPE html>
   <div class="card"><div class="label">Battery Voltage</div><div class="value" id="batteryVoltage">--</div></div>
   <div class="card"><div class="label">Battery Power</div><div class="value" id="batteryWatts">--</div>
        <div class="quality-label">+ charging / - discharging</div></div>
+  <div class="card"><div class="label">Battery Runtime</div><div class="value" id="runtime">--</div>
+       <div class="quality-label" id="runtimeLabel">set battery_capacity_kwh to enable</div></div>
+</div>
+
+<h2 class="section-title">Energy</h2>
+<div class="grid">
+  <div class="card"><div class="label">Solar Today</div><div class="value" id="pvToday">--</div>
+       <div class="quality-label" id="pvYesterday">yesterday --</div></div>
+  <div class="card"><div class="label">Load Today</div><div class="value" id="loadToday">--</div>
+       <div class="quality-label" id="loadYesterday">yesterday --</div></div>
+  <div class="card"><div class="label">Lowest SOC Today</div><div class="value" id="socMinToday">--</div>
+       <div class="quality-label" id="socMinYesterday">yesterday --</div></div>
+  <div class="card"><div class="label">Yesterday's Performance</div><div class="value" id="prYesterday">--</div>
+       <div class="quality-label" id="prLabel">needs latitude/longitude and installed_pv_kw</div></div>
 </div>
 
 <div id="inverters"></div>
@@ -417,11 +582,46 @@ function inverterCard(inv) {
     <div class="card"><div class="label">Load</div><div class="small-value">${fmt(inv.load_percent, 0, "%")}</div></div>
     <div class="card"><div class="label">PV Power</div><div class="small-value">${fmt(inv.pv_watts, 0, " W")}</div>
       <div class="quality-label">${inv.pv_quality}</div></div>
-    <div class="card"><div class="label">PV Voltage</div><div class="small-value">${fmt(inv.pv_voltage, 1, " V")}</div></div>
+    <div class="card"><div class="label">PV1</div><div class="small-value">${fmt(inv.pv1_watts, 0, " W")}</div>
+      <div class="quality-label">${fmt(inv.pv1_voltage, 0, " V")} · ${fmt(inv.pv1_current, 1, " A")}</div></div>
+    <div class="card"><div class="label">PV2</div><div class="small-value">${fmt(inv.pv2_watts, 0, " W")}</div>
+      <div class="quality-label">${fmt(inv.pv2_voltage, 0, " V")} · ${fmt(inv.pv2_current, 1, " A")}</div></div>
     <div class="card"><div class="label">Output Voltage</div><div class="small-value">${fmt(inv.output_voltage, 1, " V")}</div></div>
     <div class="card"><div class="label">Battery Voltage</div><div class="small-value">${fmt(inv.battery_voltage, 1, " V")}</div></div>
     <div class="card"><div class="label">Temperature</div><div class="small-value">${fmt(inv.inverter_temperature_c, 0, " °C")}</div></div>
   </div>`;
+}
+
+const kwh = wh => (wh === null || wh === undefined) ? "--" : (wh / 1000).toFixed(1) + " kWh";
+
+async function updateSummary() {
+  try {
+    const r = await fetch("/api/summary");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const s = await r.json();
+    document.getElementById("pvToday").textContent = kwh(s.today.pv_wh);
+    document.getElementById("loadToday").textContent = kwh(s.today.load_wh);
+    document.getElementById("socMinToday").textContent = fmt(s.today.battery_soc_min, 0, "%");
+    const y = s.yesterday;
+    document.getElementById("pvYesterday").textContent = "yesterday " + (y ? kwh(y.pv_energy_wh) : "--");
+    document.getElementById("loadYesterday").textContent = "yesterday " + (y ? kwh(y.load_energy_wh) : "--");
+    document.getElementById("socMinYesterday").textContent = "yesterday " + (y ? fmt(y.battery_soc_min, 0, "%") : "--");
+    if (y && y.performance_ratio !== null && y.performance_ratio !== undefined) {
+      document.getElementById("prYesterday").textContent = (y.performance_ratio * 100).toFixed(0) + "%";
+      document.getElementById("prLabel").textContent = "of nameplate × " + (y.insolation_wh_m2 / 1000).toFixed(2) + " kWh/m² insolation";
+    }
+    const b = s.battery;
+    if (b) {
+      if (b.state === "idle") {
+        document.getElementById("runtime").textContent = "idle";
+        document.getElementById("runtimeLabel").textContent = "battery power below 25 W";
+      } else {
+        document.getElementById("runtime").textContent = b.hours > 99 ? "> 99 h" : b.hours + " h";
+        document.getElementById("runtimeLabel").textContent =
+          b.state === "discharging" ? "to empty at current load" : "to full at current charge rate";
+      }
+    }
+  } catch (e) { console.error("Error loading summary:", e); }
 }
 
 async function updateInverters() {
@@ -523,11 +723,78 @@ function setHistoryRange(hours) {
 document.querySelectorAll(".history-range-button").forEach(b =>
   b.addEventListener("click", () => setHistoryRange(Number(b.dataset.hours))));
 
-updateDashboard(); updateInverters(); updateEvents(); updateHistoryCharts();
+updateDashboard(); updateSummary(); updateInverters(); updateEvents(); updateHistoryCharts();
 setInterval(updateDashboard, 10000);
+setInterval(updateSummary, 30000);
 setInterval(updateInverters, 10000);
 setInterval(updateEvents, 30000);
 setInterval(updateHistoryCharts, 60000);
+</script>
+</body>
+</html>
+"""
+
+
+DAYS_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Solar Monitor - Daily</title>
+<style>
+  body { margin: 0; padding: 20px; background: #111; color: #eee; font-family: Arial, sans-serif; }
+  h1 { margin-top: 0; }
+  a { color: #9ecbff; }
+  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
+  button, select { border: 1px solid #555; background: #222; color: #ddd; padding: 7px 12px; border-radius: 7px; cursor: pointer; }
+  .wrap { overflow-x: auto; background: #1b1b1b; border-radius: 10px; padding: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; white-space: nowrap; }
+  th, td { padding: 6px 10px; border-bottom: 1px solid #2a2a2a; text-align: right; }
+  th { color: #aaa; font-weight: normal; position: sticky; top: 0; background: #1b1b1b; }
+  td:first-child, th:first-child { text-align: left; }
+  .bar { display: inline-block; height: 8px; background: #f0b429; border-radius: 4px; vertical-align: middle; margin-left: 6px; }
+</style>
+</head>
+<body>
+<h1>Daily Summary <a href="/" style="font-size:14px;font-weight:normal;margin-left:16px">Live dashboard</a></h1>
+<div class="controls">
+  <label>Range <select id="range">
+    <option value="30">30 days</option><option value="90" selected>90 days</option>
+    <option value="365">1 year</option><option value="3660">All</option></select></label>
+  <a id="csv" href="/api/days.csv?days=90"><button>Download CSV</button></a>
+</div>
+<div class="wrap"><table>
+<thead><tr>
+  <th>Date</th><th>Solar kWh</th><th>Load kWh</th><th>Inv 1 kWh</th><th>Inv 2 kWh</th>
+  <th>Charge kWh</th><th>Discharge kWh</th><th>Peak PV W</th><th>Production h</th>
+  <th>SOC min</th><th>SOC max</th><th>RTE</th><th>Cycles</th><th>Yield kWh/kW</th>
+  <th>Insolation kWh/m²</th><th>PR</th>
+</tr></thead>
+<tbody id="rows"><tr><td>Loading...</td></tr></tbody>
+</table></div>
+<script>
+const k = v => v == null ? "--" : (v / 1000).toFixed(1);
+const n = (v, d, s) => v == null ? "--" : Number(v).toFixed(d) + (s || "");
+const pct = v => v == null ? "--" : (v * 100).toFixed(0) + "%";
+async function load() {
+  const days = document.getElementById("range").value;
+  document.getElementById("csv").href = "/api/days.csv?days=" + days;
+  const r = await fetch("/api/days?days=" + days);
+  const rows = await r.json();
+  const maxPv = Math.max(1, ...rows.map(x => x.pv_energy_wh || 0));
+  document.getElementById("rows").innerHTML = rows.length ? rows.map(x => `<tr>
+    <td>${x.date}</td>
+    <td>${k(x.pv_energy_wh)}<span class="bar" style="width:${Math.round(60 * (x.pv_energy_wh || 0) / maxPv)}px"></span></td>
+    <td>${k(x.load_energy_wh)}</td><td>${k(x.inverter_1_pv_wh)}</td><td>${k(x.inverter_2_pv_wh)}</td>
+    <td>${k(x.battery_charge_wh)}</td><td>${k(x.battery_discharge_wh)}</td>
+    <td>${n(x.pv_peak_watts, 0)}</td><td>${x.production_minutes == null ? "--" : (x.production_minutes / 60).toFixed(1)}</td>
+    <td>${n(x.battery_soc_min, 0, "%")}</td><td>${n(x.battery_soc_max, 0, "%")}</td>
+    <td>${pct(x.battery_round_trip_efficiency)}</td><td>${n(x.equivalent_battery_cycles, 2)}</td>
+    <td>${n(x.specific_yield_kwh_per_kw, 2)}</td><td>${k(x.insolation_wh_m2)}</td><td>${pct(x.performance_ratio)}</td>
+  </tr>`).join("") : "<tr><td>No completed days yet.</td></tr>";
+}
+document.getElementById("range").addEventListener("change", load);
+load();
 </script>
 </body>
 </html>
