@@ -116,6 +116,22 @@ class RetentionTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_per_inverter_energy_lands_in_daily_summary(self):
+        day = today_local() - timedelta(days=1)
+        start, end = local_day_bounds(day)
+        insert_system_rows(self.conn, start, end, step=timedelta(seconds=30), pv=1000.0)
+        conn = aggregator.connect_db()
+        try:
+            aggregator.aggregate_daily(conn)
+            aggregator.aggregate_daily_inverters(conn)
+            row = conn.execute(
+                "SELECT pv_energy_wh, inverter_1_pv_wh, inverter_2_pv_wh FROM daily_summary WHERE date=?",
+                (day.isoformat(),),
+            ).fetchone()
+            self.assertAlmostEqual(row[1] + row[2], row[0], delta=1.0)
+        finally:
+            conn.close()
+
     def test_daily_energy_matches_constant_power(self):
         # 1000 W constant for a whole completed day == 24 kWh.
         day = today_local() - timedelta(days=1)
@@ -135,3 +151,108 @@ class RetentionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PeriodAndWeatherTests(unittest.TestCase):
+    def setUp(self):
+        self.conn, self.path = fresh_db()
+
+    def tearDown(self):
+        self.conn.close()
+        cleanup_db(self.path)
+
+    def test_incremental_monthly_only_touches_recent_periods(self):
+        self.conn.executemany(
+            "INSERT INTO daily_summary(date, pv_energy_wh) VALUES(?, ?)",
+            [("2025-01-05", 1000), ("2025-01-06", 1000), ("2026-10-20", 5000)],
+        )
+        self.conn.commit()
+        conn = aggregator.connect_db()
+        try:
+            self.assertEqual(aggregator.aggregate_monthly(conn), 2)  # empty table -> full build
+            # Tamper with January so we can tell whether it was recomputed.
+            conn.execute("UPDATE monthly_summary SET pv_energy_wh = 1 WHERE month='2025-01'")
+            conn.commit()
+            n = aggregator.aggregate_monthly(conn, since=aggregator.date(2026, 10, 19))
+            self.assertEqual(n, 1)
+            jan = conn.execute(
+                "SELECT pv_energy_wh FROM monthly_summary WHERE month='2025-01'"
+            ).fetchone()[0]
+            self.assertEqual(jan, 1)  # untouched
+            oct_ = conn.execute(
+                "SELECT pv_energy_wh FROM monthly_summary WHERE month='2026-10'"
+            ).fetchone()[0]
+            self.assertEqual(oct_, 5000)
+        finally:
+            conn.close()
+
+    def test_performance_ratio_from_insolation(self):
+        day = today_local() - timedelta(days=1)
+        start, end = local_day_bounds(day)
+        insert_system_rows(self.conn, start, end, step=timedelta(seconds=30), pv=2000.0)
+        self.conn.execute("UPDATE system_config SET value='10' WHERE key='installed_pv_kw'")
+        # 24 hourly rows of 200 W/m² -> 4800 Wh/m²
+        hours = int((end - start).total_seconds() // 3600)
+        self.conn.executemany(
+            "INSERT INTO weather_samples(timestamp, ghi_wm2, source) VALUES(?, 200, 't')",
+            [(to_iso(start + timedelta(hours=i + 1)),) for i in range(hours)],
+        )
+        self.conn.commit()
+        conn = aggregator.connect_db()
+        try:
+            aggregator.aggregate_daily(conn)
+            row = conn.execute(
+                "SELECT insolation_wh_m2, performance_ratio FROM daily_summary WHERE date=?",
+                (day.isoformat(),),
+            ).fetchone()
+            self.assertAlmostEqual(row[0], 200 * hours)
+            # PR = 2000 W * hours / (10 kW * 200 * hours) = 1.0
+            self.assertAlmostEqual(row[1], 1.0, delta=0.01)
+        finally:
+            conn.close()
+
+    def test_partial_weather_coverage_gives_no_ratio(self):
+        day = today_local() - timedelta(days=1)
+        start, end = local_day_bounds(day)
+        insert_system_rows(self.conn, start, end)
+        self.conn.execute("UPDATE system_config SET value='10' WHERE key='installed_pv_kw'")
+        self.conn.execute(
+            "INSERT INTO weather_samples(timestamp, ghi_wm2) VALUES(?, 500)",
+            (to_iso(start + timedelta(hours=12)),),
+        )
+        self.conn.commit()
+        conn = aggregator.connect_db()
+        try:
+            aggregator.aggregate_daily(conn)
+            row = conn.execute(
+                "SELECT insolation_wh_m2, performance_ratio FROM daily_summary"
+            ).fetchone()
+            self.assertIsNone(row[0])
+            self.assertIsNone(row[1])
+        finally:
+            conn.close()
+
+    def test_stale_check(self):
+        from unittest import mock
+
+        import alerts
+
+        now = now_utc()
+        insert_system_rows(self.conn, now - timedelta(hours=2), now - timedelta(hours=1))
+        conn = aggregator.connect_db()
+        try:
+            with mock.patch.object(alerts, "send", return_value=True) as send:
+                age = aggregator.check_telemetry_age(conn, stale_after=600)
+                self.assertGreater(age, 3000)
+                send.assert_called_once()
+                self.assertIn("stale", send.call_args[0][0].lower())
+                # Within cooldown: no second notification.
+                aggregator.check_telemetry_age(conn, stale_after=600)
+                send.assert_called_once()
+                # Fresh data clears it.
+                insert_system_rows(self.conn, now - timedelta(seconds=20), now)
+                aggregator.check_telemetry_age(conn, stale_after=600)
+                self.assertEqual(send.call_count, 2)
+                self.assertIn("resumed", send.call_args[0][0].lower())
+        finally:
+            conn.close()

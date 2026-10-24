@@ -78,3 +78,72 @@ class ApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SummaryTests(unittest.TestCase):
+    def setUp(self):
+        self.conn, self.path = fresh_db()
+        settings.LIVE_PATH = Path(tempfile.mktemp(suffix=".json"))
+        self.client = webapp.app.test_client()
+        from timeutil import local_day_bounds, today_local
+
+        self.today = today_local()
+        self.start, _ = local_day_bounds(self.today)
+
+    def tearDown(self):
+        self.conn.close()
+        cleanup_db(self.path)
+
+    def test_energy_today_combines_quarters_and_raw_tail(self):
+        q = self.start
+        self.conn.execute(
+            "INSERT INTO quarter_hour_summary(timestamp,pv_energy_wh,load_energy_wh,sample_count)"
+            " VALUES(?,250,100,90)",
+            (to_iso(q),),
+        )
+        # raw tail after the quarter: 1000 W for 60 s = 16.67 Wh
+        t = q + timedelta(minutes=15)
+        for i in range(7):
+            self.conn.execute(
+                "INSERT INTO system_samples(timestamp,total_pv_watts,total_load_watts,battery_soc,battery_watts)"
+                " VALUES(?,1000,500,60,-1000)",
+                (to_iso(t + timedelta(seconds=10 * i)),),
+            )
+        self.conn.execute("UPDATE system_config SET value='10' WHERE key='battery_capacity_kwh'")
+        self.conn.execute(
+            "INSERT INTO daily_summary(date,pv_energy_wh,load_energy_wh,battery_soc_min) VALUES(?,12000,8000,45)",
+            ((self.today - timedelta(days=1)).isoformat(),),
+        )
+        self.conn.commit()
+        s = self.client.get("/api/summary").get_json()
+        self.assertEqual(s["today"]["pv_wh"], 267)
+        self.assertEqual(s["today"]["load_wh"], 108)
+        self.assertEqual(s["today"]["battery_soc_min"], 60)
+        self.assertEqual(s["yesterday"]["pv_energy_wh"], 12000)
+        # discharging 1000 W at 60% of 10 kWh -> 6 h
+        self.assertEqual(s["battery"], {"state": "discharging", "hours": 6.0})
+
+    def test_runtime_states(self):
+        self.assertIsNone(webapp.battery_runtime({"battery_soc": 50, "battery_watts": 100}, 0))
+        self.assertEqual(
+            webapp.battery_runtime({"battery_soc": 50, "battery_watts": 10}, 10)["state"], "idle"
+        )
+        charging = webapp.battery_runtime({"battery_soc": 50, "battery_watts": 2500}, 10)
+        self.assertEqual(charging, {"state": "charging", "hours": 2.0})
+
+    def test_days_json_and_csv(self):
+        self.conn.execute(
+            "INSERT INTO daily_summary(date,pv_energy_wh,load_energy_wh,inverter_1_pv_wh)"
+            " VALUES(?,12000,8000,7000)",
+            ((self.today - timedelta(days=1)).isoformat(),),
+        )
+        self.conn.commit()
+        rows = self.client.get("/api/days?days=7").get_json()
+        self.assertEqual(rows[0]["inverter_1_pv_wh"], 7000)
+        self.assertIsNone(rows[0]["inverter_2_pv_wh"])
+        csv_resp = self.client.get("/api/days.csv?days=7")
+        self.assertEqual(csv_resp.mimetype, "text/csv")
+        lines = csv_resp.get_data(as_text=True).strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith("date,pv_energy_wh"))
+        self.assertEqual(self.client.get("/days").status_code, 200)

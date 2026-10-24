@@ -134,3 +134,20 @@ class CollectorCycleTests(unittest.TestCase):
         self.assertEqual(data["inverters"][1]["pv_quality"], "estimated")
         self.assertFalse(data["any_fault"])
         settings.LIVE_PATH = settings.LIVE_PATH  # untouched
+
+
+class LowSocTrackerTests(unittest.TestCase):
+    def test_hysteresis(self):
+        t = collector.LowSocTracker(20, clear_margin=5)
+        self.assertIsNone(t.update(50))
+        self.assertEqual(t.update(19), "low")
+        self.assertIsNone(t.update(18))
+        self.assertIsNone(t.update(22))  # not yet above threshold + margin
+        self.assertEqual(t.update(25), "recovered")
+        self.assertIsNone(t.update(None))
+
+    def test_per_string_values_recorded(self):
+        readings = collector.read_inverters(StubLink())
+        self.assertEqual(readings[0]["pv1_watts"], 412)
+        self.assertEqual(readings[0]["pv2_watts"], 385)
+        self.assertAlmostEqual(readings[1]["pv1_watts"], 334.5 * 1.2)
