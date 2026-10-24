@@ -436,201 +436,277 @@ def healthz():
 # ------------------------------------------------------------------ dashboard
 
 
+# Shared look for both pages. No external assets: the Pi may be offline.
+BASE_CSS = r"""
+  :root {
+    --bg: #111; --surface: #1b1b1b; --surface-2: #242424; --line: #2c2c2c; --line-2: #3a3a3a;
+    --text: #ececec; --muted: #a6a6a6; --faint: #6f6f6f;
+    --solar: #c98500; --load: #3987e5; --soc: #199e70;
+    --good: #3fb950; --warn: #e3a008; --bad: #e66767; --info: #9ecbff;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; padding: 0 16px 32px; background: var(--bg); color: var(--text);
+         font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         font-size: 15px; line-height: 1.35; }
+  a { color: var(--info); }
+  .topbar { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; padding: 14px 0 10px;
+            border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+  .brand { font-size: 20px; font-weight: 700; letter-spacing: 0.2px; }
+  .topbar nav { display: flex; gap: 4px; }
+  .topbar nav a { color: var(--muted); text-decoration: none; padding: 5px 10px; border-radius: 6px; font-size: 14px; }
+  .topbar nav a:hover { color: var(--text); background: var(--surface); }
+  .topbar nav a.active { color: var(--text); background: var(--surface-2); }
+  .status { margin-left: auto; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--faint); flex: none; }
+  .dot.live { background: var(--good); box-shadow: 0 0 0 3px rgba(63,185,80,0.18); }
+  .dot.stale { background: var(--warn); }
+  .dot.down { background: var(--bad); }
+  h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em;
+       color: var(--muted); margin: 26px 0 10px; }
+  .card { background: var(--surface); border-radius: 10px; padding: 14px 16px; }
+  .num { font-variant-numeric: tabular-nums; }
+  .btn, button, select { border: 1px solid var(--line-2); background: var(--surface); color: var(--text);
+         padding: 6px 12px; border-radius: 7px; cursor: pointer; font: inherit; font-size: 13px; text-decoration: none; }
+  .btn:hover, button:hover { background: var(--surface-2); }
+  .muted { color: var(--muted); }
+"""
+
+
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
 <title>Solar Monitor</title>
 <style>
-  * { box-sizing: border-box; }
-  body { margin: 0; padding: 20px; background: #111; color: #eee; font-family: Arial, sans-serif; }
-  h1 { margin-top: 0; }
-  .status { margin-bottom: 18px; color: #aaa; }
-  .banner { display: none; margin-bottom: 18px; padding: 12px 16px; border-radius: 8px;
-            background: #5a2a00; color: #ffd9b3; border: 1px solid #b35900; }
-  .banner.fault { background: #5a0000; color: #ffc9c9; border-color: #b30000; }
+__BASE_CSS__
+  .banner { display: none; margin-bottom: 16px; padding: 12px 16px; border-radius: 8px;
+            background: #4a2600; color: #ffd9b3; border: 1px solid #8a4a00; }
+  .banner.fault { background: #4a0f0f; color: #ffc9c9; border-color: #8a2a2a; }
   .banner.show { display: block; }
-  .section-title { margin-top: 32px; margin-bottom: 12px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
-  .card { background: #1b1b1b; border-radius: 10px; padding: 16px; }
-  .label { color: #aaa; font-size: 14px; }
-  .value { margin-top: 8px; font-size: 28px; font-weight: bold; }
-  .small-value { margin-top: 8px; font-size: 22px; font-weight: bold; }
-  .quality-label { margin-top: 6px; font-size: 13px; opacity: 0.75; }
-  .fault { color: #ff6b6b; }
-  .history-controls { display: flex; gap: 8px; margin: 10px 0 16px 0; flex-wrap: wrap; }
-  .history-range-button { border: 1px solid #555; background: #222; color: #ddd;
-                          padding: 7px 12px; border-radius: 7px; cursor: pointer; }
-  .history-range-button.active { background: #444; border-color: #888; }
-  .chart-card { margin-top: 14px; padding: 16px; background: #1b1b1b; border-radius: 10px; }
-  .chart-card canvas { width: 100%; height: 260px; display: block; }
+
+  .tiles { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  .tiles.secondary { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+  .tile { background: var(--surface); border-radius: 10px; padding: 14px 16px 12px; position: relative; overflow: hidden; }
+  .tile::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--accent, transparent); }
+  .tile .label { color: var(--muted); font-size: 13px; }
+  .tile .value { margin-top: 6px; font-size: 30px; font-weight: 700; line-height: 1.1; letter-spacing: -0.3px; }
+  .tiles.secondary .value { font-size: 24px; }
+  .tile .value small { font-size: 15px; font-weight: 500; color: var(--muted); margin-left: 2px; }
+  .tile .sub { margin-top: 6px; font-size: 13px; color: var(--muted); min-height: 1.2em; }
+  .tile.solar { --accent: var(--solar); } .tile.load { --accent: var(--load); } .tile.battery { --accent: var(--soc); }
+  body.stale .tile .value, body.stale .inv .v { opacity: 0.5; }
+  .bar-track { height: 6px; border-radius: 3px; background: var(--surface-2); margin-top: 10px; overflow: hidden; }
+  .bar-fill { height: 100%; width: 0; border-radius: 3px; background: var(--good); transition: width 0.6s ease; }
+  .bar-fill.warn { background: var(--warn); } .bar-fill.bad { background: var(--bad); }
+
+  .inverters { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .inv-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .inv-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
+  .chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--surface-2); color: var(--muted); white-space: nowrap; }
+  .chip.fault { background: #4a0f0f; color: #ffc9c9; }
+  .chip.ok { color: var(--good); }
+  .kv { display: grid; grid-template-columns: 1fr 1fr; gap: 0 18px; }
+  .kv .row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+             padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+  .kv .k { color: var(--muted); }
+  .kv .v { font-weight: 600; text-align: right; }
+  .kv .v small { font-weight: 400; color: var(--muted); font-size: 12px; margin-left: 4px; }
+  .kv .v.fault { color: var(--bad); }
+  @media (max-width: 420px) { .kv { grid-template-columns: 1fr; } }
+
+  .history-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 26px 0 10px; }
+  .history-head h2 { margin: 0; }
+  .ranges { display: flex; gap: 2px; flex-wrap: wrap; background: var(--surface); padding: 3px; border-radius: 8px; }
+  .ranges button { border: 0; background: transparent; color: var(--muted); padding: 5px 9px; border-radius: 6px; font-size: 13px; }
+  .ranges button:hover { color: var(--text); }
+  .ranges button.active { background: var(--surface-2); color: var(--text); font-weight: 600; }
+  .chart-card { margin-top: 12px; padding: 14px 16px 10px; position: relative; }
+  .chart-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 6px; }
+  .chart-title { font-size: 14px; font-weight: 600; }
+  .legend { display: flex; gap: 14px; font-size: 13px; color: var(--muted); }
+  .legend span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 3px;
+                         margin-right: 6px; vertical-align: -1px; background: var(--c); }
+  .chart-card canvas { width: 100%; height: 240px; display: block; touch-action: pan-y; cursor: crosshair; }
+  @media (max-width: 600px) { .chart-card canvas { height: 200px; } }
+  .tip { position: absolute; pointer-events: none; display: none; background: #000; color: var(--text);
+         border: 1px solid var(--line-2); border-radius: 7px; padding: 7px 10px; font-size: 12.5px;
+         white-space: nowrap; z-index: 2; box-shadow: 0 4px 16px rgba(0,0,0,0.5); }
+  .tip .t { color: var(--muted); margin-bottom: 4px; }
+  .tip .r { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+  .tip .r i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+  .tip .r b { font-weight: 600; min-width: 3.5em; text-align: right; }
+
   table.events { width: 100%; border-collapse: collapse; font-size: 14px; }
-  table.events td { padding: 6px 8px; border-bottom: 1px solid #2a2a2a; vertical-align: top; }
-  table.events td.time { color: #aaa; white-space: nowrap; }
-  .sev-info { color: #9ecbff; } .sev-warning { color: #ffc966; } .sev-error { color: #ff6b6b; }
-  a.nav { font-size: 14px; font-weight: normal; margin-left: 16px; color: #9ecbff; }
+  table.events td { padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  table.events tr:last-child td { border-bottom: 0; }
+  table.events td.time { color: var(--muted); white-space: nowrap; width: 1%; }
+  table.events td.type { white-space: nowrap; width: 1%; }
+  .sev { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; vertical-align: 0; background: var(--faint); }
+  .sev.info { background: var(--info); } .sev.warning { background: var(--warn); } .sev.error, .sev.critical { background: var(--bad); }
+  .events-wrap { padding: 4px 8px; }
+  @media (max-width: 600px) {
+    body { padding: 0 12px 24px; }
+    .tile .value { font-size: 26px; }
+    table.events td.type { display: none; }
+  }
 </style>
 </head>
 <body>
 
-<h1>Solar Monitor <a class="nav" href="/days">Daily table</a></h1>
-<div class="status" id="status">Waiting for telemetry...</div>
+<header class="topbar">
+  <div class="brand">Solar Monitor</div>
+  <nav><a href="/" class="active">Live</a><a href="/days">Daily table</a></nav>
+  <div class="status"><span class="dot" id="statusDot"></span><span id="status">Waiting for telemetry…</span></div>
+</header>
 <div class="banner" id="banner"></div>
 
-<h2 class="section-title">System</h2>
-<div class="grid">
-  <div class="card"><div class="label">Solar Production</div><div class="value" id="pvWatts">--</div></div>
-  <div class="card"><div class="label">House Load</div><div class="value" id="loadWatts">--</div></div>
-  <div class="card"><div class="label">Battery SOC</div><div class="value" id="batterySoc">--</div></div>
-  <div class="card"><div class="label">Battery Voltage</div><div class="value" id="batteryVoltage">--</div></div>
-  <div class="card"><div class="label">Battery Power</div><div class="value" id="batteryWatts">--</div>
-       <div class="quality-label">+ charging / - discharging</div></div>
-  <div class="card"><div class="label">Battery Runtime</div><div class="value" id="runtime">--</div>
-       <div class="quality-label" id="runtimeLabel">set battery_capacity_kwh to enable</div></div>
-  <div class="card"><div class="label">Utility / AC Input</div><div class="value" id="grid">--</div>
-       <div class="quality-label" id="gridLabel"></div></div>
+<div class="tiles">
+  <div class="tile solar"><div class="label">Solar production</div>
+    <div class="value num" id="pvWatts">--</div>
+    <div class="sub num" id="pvSub">today -- · yesterday --</div></div>
+  <div class="tile load"><div class="label">House load</div>
+    <div class="value num" id="loadWatts">--</div>
+    <div class="sub num" id="loadSub">today -- · yesterday --</div></div>
+  <div class="tile battery"><div class="label">Battery</div>
+    <div class="value num" id="batterySoc">--</div>
+    <div class="bar-track"><div class="bar-fill" id="socBar"></div></div>
+    <div class="sub num" id="batterySub">--</div></div>
+  <div class="tile"><div class="label">Utility / AC input</div>
+    <div class="value" id="grid">--</div>
+    <div class="sub num" id="gridLabel"></div></div>
 </div>
 
-<h2 class="section-title">Energy</h2>
-<div class="grid">
-  <div class="card"><div class="label">Solar Today</div><div class="value" id="pvToday">--</div>
-       <div class="quality-label" id="pvYesterday">yesterday --</div></div>
-  <div class="card"><div class="label">Load Today</div><div class="value" id="loadToday">--</div>
-       <div class="quality-label" id="loadYesterday">yesterday --</div></div>
-  <div class="card"><div class="label">Lowest SOC Today</div><div class="value" id="socMinToday">--</div>
-       <div class="quality-label" id="socMinYesterday">yesterday --</div></div>
-  <div class="card"><div class="label">Yesterday's Performance</div><div class="value" id="prYesterday">--</div>
-       <div class="quality-label" id="prLabel">needs latitude/longitude and installed_pv_kw</div></div>
+<div class="tiles secondary" style="margin-top:12px">
+  <div class="tile"><div class="label">Battery power</div><div class="value num" id="batteryWatts">--</div>
+    <div class="sub" id="batteryWattsLabel"></div></div>
+  <div class="tile"><div class="label">Battery runtime</div><div class="value num" id="runtime">--</div>
+    <div class="sub" id="runtimeLabel">set battery_capacity_kwh to enable</div></div>
+  <div class="tile"><div class="label">Lowest SOC today</div><div class="value num" id="socMinToday">--</div>
+    <div class="sub num" id="socMinYesterday">yesterday --</div></div>
+  <div class="tile"><div class="label">Yesterday's performance</div><div class="value num" id="prYesterday">--</div>
+    <div class="sub" id="prLabel">needs latitude/longitude and installed_pv_kw</div></div>
 </div>
 
-<div id="inverters"></div>
+<h2>Inverters</h2>
+<div class="inverters" id="inverters"><div class="card muted">Waiting for inverter telemetry…</div></div>
 
-<h2 class="section-title" id="historyTitle">Last 24 Hours</h2>
-<div class="history-controls">
-  <button class="history-range-button" data-hours="1">1h</button>
-  <button class="history-range-button" data-hours="6">6h</button>
-  <button class="history-range-button active" data-hours="24">24h</button>
-  <button class="history-range-button" data-hours="168">7d</button>
-  <button class="history-range-button" data-hours="336">2w</button>
-  <button class="history-range-button" data-hours="720">1m</button>
-  <button class="history-range-button" data-hours="2160">3m</button>
-  <button class="history-range-button" data-hours="4320">6m</button>
-  <button class="history-range-button" data-hours="6480">9m</button>
-  <button class="history-range-button" data-hours="8760">1y</button>
-  <button class="history-range-button" data-hours="17520">2y</button>
-  <button class="history-range-button" data-hours="26280">3y</button>
+<div class="history-head">
+  <h2 id="historyTitle">Last 24 hours</h2>
+  <div class="ranges" id="ranges">
+    <button data-hours="1">1h</button><button data-hours="6">6h</button>
+    <button data-hours="24" class="active">24h</button><button data-hours="168">7d</button>
+    <button data-hours="336">2w</button><button data-hours="720">1m</button>
+    <button data-hours="2160">3m</button><button data-hours="4320">6m</button>
+    <button data-hours="8760">1y</button><button data-hours="17520">2y</button>
+    <button data-hours="26280">3y</button>
+  </div>
 </div>
 
-<div class="chart-card"><div class="label" id="pvHistoryLabel">Solar Production</div>
-  <canvas id="pvChart" width="900" height="260"></canvas></div>
-<div class="chart-card"><div class="label" id="loadHistoryLabel">House Load</div>
-  <canvas id="loadChart" width="900" height="260"></canvas></div>
-<div class="chart-card"><div class="label">Battery SOC</div>
-  <canvas id="socChart" width="900" height="260"></canvas></div>
+<div class="card chart-card">
+  <div class="chart-head"><div class="chart-title" id="powerTitle">Power</div>
+    <div class="legend"><span style="--c:var(--solar)" id="pvLegend">Solar</span><span style="--c:var(--load)" id="loadLegend">Load</span></div></div>
+  <canvas id="powerChart"></canvas><div class="tip" id="powerTip"></div>
+</div>
+<div class="card chart-card">
+  <div class="chart-head"><div class="chart-title">Battery state of charge</div></div>
+  <canvas id="socChart"></canvas><div class="tip" id="socTip"></div>
+</div>
 
-<h2 class="section-title">Recent Events</h2>
-<div class="card"><table class="events"><tbody id="events"><tr><td>No events recorded.</td></tr></tbody></table></div>
+<h2>Recent events</h2>
+<div class="card events-wrap"><table class="events"><tbody id="events"><tr><td class="muted">No events recorded.</td></tr></tbody></table></div>
 
 <script>
+"use strict";
 let historyHours = 24;
-
-const LABELS = {1:"Last Hour",6:"Last 6 Hours",24:"Last 24 Hours",168:"Last 7 Days",
-  336:"Last 2 Weeks",720:"Last Month",2160:"Last 3 Months",4320:"Last 6 Months",
-  6480:"Last 9 Months",8760:"Last Year",17520:"Last 2 Years",26280:"Last 3 Years"};
-
-const fmt = (v, d, unit) => (v === null || v === undefined || Number.isNaN(Number(v)))
-  ? "--" : Number(v).toFixed(d) + unit;
-const localTime = iso => { const d = new Date(iso); return Number.isFinite(d.getTime()) ? d.toLocaleString() : iso; };
+const LABELS = {1:"Last hour",6:"Last 6 hours",24:"Last 24 hours",168:"Last 7 days",336:"Last 2 weeks",
+  720:"Last month",2160:"Last 3 months",4320:"Last 6 months",8760:"Last year",17520:"Last 2 years",26280:"Last 3 years"};
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const isNum = v => v !== null && v !== undefined && Number.isFinite(Number(v));
+const fmt = (v, d, unit) => isNum(v) ? Number(v).toFixed(d) + unit : "--";
+const watts = v => !isNum(v) ? "--" : Math.abs(v) >= 10000 ? (v / 1000).toFixed(1) + " kW" : Math.round(v) + " W";
+const kwh = wh => isNum(wh) ? (wh / 1000).toFixed(1) + " kWh" : "--";
 const ageText = s => s < 90 ? s + " s" : s < 5400 ? Math.round(s / 60) + " min" : (s / 3600).toFixed(1) + " h";
+const sameDay = (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+function whenText(iso) {
+  const d = new Date(iso); if (!Number.isFinite(d.getTime())) return iso;
+  const now = new Date(), yest = new Date(now); yest.setDate(now.getDate() - 1);
+  const t = d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+  if (sameDay(d, now)) return "Today " + t;
+  if (sameDay(d, yest)) return "Yesterday " + t;
+  return d.toLocaleDateString([], {month: "short", day: "numeric"}) + ", " + t;
+}
+const setDot = cls => { $("statusDot").className = "dot " + cls; };
 
+let latest = {};
 async function updateDashboard() {
-  const banner = document.getElementById("banner");
+  const banner = $("banner");
   try {
     const r = await fetch("/api/latest");
     if (!r.ok) throw new Error("HTTP " + r.status);
-    const d = await r.json();
-    document.getElementById("pvWatts").textContent = fmt(d.pv_watts, 0, " W");
-    document.getElementById("loadWatts").textContent = fmt(d.load_watts, 0, " W");
-    document.getElementById("batterySoc").textContent = fmt(d.battery_soc, 0, "%");
-    document.getElementById("batteryVoltage").textContent = fmt(d.battery_voltage, 1, " V");
-    document.getElementById("batteryWatts").textContent = fmt(d.battery_watts, 0, " W");
+    const d = latest = await r.json();
+    $("pvWatts").textContent = watts(d.pv_watts);
+    $("loadWatts").textContent = watts(d.load_watts);
+    $("batterySoc").innerHTML = isNum(d.battery_soc) ? Math.round(d.battery_soc) + "<small>%</small>" : "--";
+    const soc = Number(d.battery_soc);
+    const fill = $("socBar");
+    fill.style.width = isNum(d.battery_soc) ? Math.max(0, Math.min(100, soc)) + "%" : "0";
+    fill.className = "bar-fill" + (soc < 25 ? " bad" : soc < 40 ? " warn" : "");
+    const bw = Number(d.battery_watts);
+    const flow = !isNum(d.battery_watts) ? "" : Math.abs(bw) < 25 ? "idle" : bw > 0 ? "charging at " + watts(bw) : "discharging at " + watts(-bw);
+    $("batterySub").textContent = [fmt(d.battery_voltage, 1, " V"), flow].filter(Boolean).join(" · ");
+    $("batteryWatts").textContent = isNum(d.battery_watts) ? (bw > 0 ? "+" : bw < 0 ? "−" : "") + watts(Math.abs(bw)) : "--";
+    $("batteryWattsLabel").textContent = !isNum(d.battery_watts) ? "" : Math.abs(bw) < 25 ? "idle" : bw > 0 ? "charging" : "discharging";
     if (d.grid_present === true) {
-      document.getElementById("grid").textContent = "On";
-      document.getElementById("gridLabel").textContent = fmt(d.grid_voltage, 0, " V") + " at the input";
+      $("grid").textContent = "On";
+      $("gridLabel").textContent = fmt(d.grid_voltage, 0, " V") + " at the input";
     } else if (d.grid_present === false) {
-      document.getElementById("grid").textContent = "Off";
-      document.getElementById("gridLabel").textContent = "running on solar and battery";
-    }
-    document.getElementById("status").textContent =
-      "Last update: " + localTime(d.timestamp) + " | " + d.inverter_count + " inverters | " + d.source;
+      $("grid").textContent = "Off";
+      $("gridLabel").textContent = "running on solar and battery";
+    } else { $("grid").textContent = "--"; $("gridLabel").textContent = ""; }
+    const when = new Date(d.timestamp);
+    $("status").textContent = "Updated " + (Number.isFinite(when.getTime()) ? when.toLocaleTimeString([], {hour: "numeric", minute: "2-digit", second: "2-digit"}) : d.timestamp)
+      + " · " + d.inverter_count + " inverters · " + d.source;
+    document.body.classList.toggle("stale", !!d.stale);
+    document.title = (isNum(d.pv_watts) ? (d.pv_watts / 1000).toFixed(1) + " kW · " : "") + (isNum(d.battery_soc) ? Math.round(d.battery_soc) + "% · " : "") + "Solar Monitor";
     banner.className = "banner";
     if (d.stale) {
+      setDot("stale");
       banner.textContent = "Telemetry is stale: last reading was " + ageText(d.age_seconds) + " ago. The collector may be down.";
       banner.classList.add("show");
     } else if (d.any_fault) {
-      banner.textContent = "An inverter is reporting a fault. See inverter cards and events.";
+      setDot("live");
+      banner.textContent = "An inverter is reporting a fault. See the inverter cards and events below.";
       banner.classList.add("show", "fault");
-    }
+    } else setDot("live");
   } catch (e) {
-    document.getElementById("status").textContent = "Telemetry unavailable: " + e;
+    setDot("down");
+    $("status").textContent = "Telemetry unavailable: " + e.message;
   }
 }
 
 function inverterCard(inv) {
   const faulted = inv.fault_code && !["", "00", "0"].includes(inv.fault_code);
-  return `
-  <h2 class="section-title">Inverter ${inv.inverter_id}</h2>
-  <div class="grid">
-    <div class="card"><div class="label">Mode</div>
-      <div class="small-value">${inv.mode_name || "--"}</div>
-      <div class="quality-label">code ${inv.mode || "--"}</div></div>
-    <div class="card"><div class="label">Fault</div>
-      <div class="small-value ${faulted ? "fault" : ""}">${faulted ? "Code " + inv.fault_code : "None"}</div></div>
-    <div class="card"><div class="label">Output Power</div><div class="small-value">${fmt(inv.output_watts, 0, " W")}</div></div>
-    <div class="card"><div class="label">Load</div><div class="small-value">${fmt(inv.load_percent, 0, "%")}</div></div>
-    <div class="card"><div class="label">PV Power</div><div class="small-value">${fmt(inv.pv_watts, 0, " W")}</div>
-      <div class="quality-label">${inv.pv_quality}</div></div>
-    <div class="card"><div class="label">PV1</div><div class="small-value">${fmt(inv.pv1_watts, 0, " W")}</div>
-      <div class="quality-label">${fmt(inv.pv1_voltage, 0, " V")} · ${fmt(inv.pv1_current, 1, " A")}</div></div>
-    <div class="card"><div class="label">PV2</div><div class="small-value">${fmt(inv.pv2_watts, 0, " W")}</div>
-      <div class="quality-label">${fmt(inv.pv2_voltage, 0, " V")} · ${fmt(inv.pv2_current, 1, " A")}</div></div>
-    <div class="card"><div class="label">Output Voltage</div><div class="small-value">${fmt(inv.output_voltage, 1, " V")}</div></div>
-    <div class="card"><div class="label">Battery Voltage</div><div class="small-value">${fmt(inv.battery_voltage, 1, " V")}</div></div>
-    <div class="card"><div class="label">Temperature</div><div class="small-value">${fmt(inv.inverter_temperature_c, 0, " °C")}</div></div>
-  </div>`;
-}
-
-const kwh = wh => (wh === null || wh === undefined) ? "--" : (wh / 1000).toFixed(1) + " kWh";
-
-async function updateSummary() {
-  try {
-    const r = await fetch("/api/summary");
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const s = await r.json();
-    document.getElementById("pvToday").textContent = kwh(s.today.pv_wh);
-    document.getElementById("loadToday").textContent = kwh(s.today.load_wh);
-    document.getElementById("socMinToday").textContent = fmt(s.today.battery_soc_min, 0, "%");
-    const y = s.yesterday;
-    document.getElementById("pvYesterday").textContent = "yesterday " + (y ? kwh(y.pv_energy_wh) : "--");
-    document.getElementById("loadYesterday").textContent = "yesterday " + (y ? kwh(y.load_energy_wh) : "--");
-    document.getElementById("socMinYesterday").textContent = "yesterday " + (y ? fmt(y.battery_soc_min, 0, "%") : "--");
-    if (y && y.performance_ratio !== null && y.performance_ratio !== undefined) {
-      document.getElementById("prYesterday").textContent = (y.performance_ratio * 100).toFixed(0) + "%";
-      document.getElementById("prLabel").textContent = "of nameplate × " + (y.insolation_wh_m2 / 1000).toFixed(2) + " kWh/m² insolation";
-    }
-    const b = s.battery;
-    if (b) {
-      if (b.state === "idle") {
-        document.getElementById("runtime").textContent = "idle";
-        document.getElementById("runtimeLabel").textContent = "battery power below 25 W";
-      } else {
-        document.getElementById("runtime").textContent = b.hours > 99 ? "> 99 h" : b.hours + " h";
-        document.getElementById("runtimeLabel").textContent =
-          b.state === "discharging" ? "to empty at current load" : "to full at current charge rate";
-      }
-    }
-  } catch (e) { console.error("Error loading summary:", e); }
+  const row = (k, v, small) => `<div class="row"><span class="k">${k}</span><span class="v num${v === "fault" ? " fault" : ""}">${v}${small ? `<small>${small}</small>` : ""}</span></div>`;
+  return `<div class="card inv">
+    <div class="inv-head"><h3>Inverter ${esc(inv.inverter_id)}</h3>
+      <span class="chip">${esc(inv.mode_name || "--")} · ${esc(inv.mode || "?")}</span>
+      ${faulted ? `<span class="chip fault">Fault ${esc(inv.fault_code)}</span>` : `<span class="chip ok">no fault</span>`}
+      <span class="chip">PV ${esc(inv.pv_quality)}</span></div>
+    <div class="kv">
+      ${row("Output", watts(inv.output_watts), fmt(inv.load_percent, 0, "% load"))}
+      ${row("PV total", watts(inv.pv_watts), fmt(inv.pv_voltage, 0, " V"))}
+      ${row("PV string 1", watts(inv.pv1_watts), fmt(inv.pv1_voltage, 0, " V") + " · " + fmt(inv.pv1_current, 1, " A"))}
+      ${row("PV string 2", watts(inv.pv2_watts), fmt(inv.pv2_voltage, 0, " V") + " · " + fmt(inv.pv2_current, 1, " A"))}
+      ${row("AC output", fmt(inv.output_voltage, 1, " V"), fmt(inv.output_frequency, 1, " Hz"))}
+      ${row("Battery", fmt(inv.battery_voltage, 1, " V"), fmt(inv.battery_soc, 0, "%"))}
+      ${row("Temperature", fmt(inv.inverter_temperature_c, 0, " °C"))}
+      ${row("Last sample", esc(whenText(inv.timestamp)))}
+    </div></div>`;
 }
 
 async function updateInverters() {
@@ -638,8 +714,33 @@ async function updateInverters() {
     const r = await fetch("/api/inverters");
     if (!r.ok) throw new Error("HTTP " + r.status);
     const invs = await r.json();
-    document.getElementById("inverters").innerHTML = invs.map(inverterCard).join("");
+    $("inverters").innerHTML = invs.length ? invs.map(inverterCard).join("") : '<div class="card muted">No inverter samples yet.</div>';
   } catch (e) { console.error("Error loading inverter telemetry:", e); }
+}
+
+async function updateSummary() {
+  try {
+    const r = await fetch("/api/summary");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const s = await r.json();
+    const y = s.yesterday;
+    $("pvSub").textContent = "today " + kwh(s.today.pv_wh) + " · yesterday " + (y ? kwh(y.pv_energy_wh) : "--");
+    $("loadSub").textContent = "today " + kwh(s.today.load_wh) + " · yesterday " + (y ? kwh(y.load_energy_wh) : "--");
+    $("socMinToday").textContent = fmt(s.today.battery_soc_min, 0, "%");
+    $("socMinYesterday").textContent = "yesterday " + (y ? fmt(y.battery_soc_min, 0, "%") : "--");
+    if (y && isNum(y.performance_ratio)) {
+      $("prYesterday").textContent = (y.performance_ratio * 100).toFixed(0) + "%";
+      $("prLabel").textContent = "of nameplate × " + (y.insolation_wh_m2 / 1000).toFixed(2) + " kWh/m² insolation";
+    }
+    const b = s.battery;
+    if (b) {
+      if (b.state === "idle") { $("runtime").textContent = "idle"; $("runtimeLabel").textContent = "battery power below 25 W"; }
+      else {
+        $("runtime").textContent = b.hours > 99 ? "> 99 h" : b.hours + " h";
+        $("runtimeLabel").textContent = b.state === "discharging" ? "to empty at current load" : "to full at current charge rate";
+      }
+    }
+  } catch (e) { console.error("Error loading summary:", e); }
 }
 
 async function updateEvents() {
@@ -647,65 +748,195 @@ async function updateEvents() {
     const r = await fetch("/api/events?limit=25");
     if (!r.ok) throw new Error("HTTP " + r.status);
     const events = await r.json();
-    const body = document.getElementById("events");
-    if (!events.length) { body.innerHTML = "<tr><td>No events recorded.</td></tr>"; return; }
+    const body = $("events");
+    if (!events.length) { body.innerHTML = '<tr><td class="muted">No events recorded.</td></tr>'; return; }
     body.innerHTML = events.map(ev => `<tr>
-      <td class="time">${localTime(ev.timestamp)}</td>
-      <td class="sev-${ev.severity}">${ev.severity}</td>
-      <td>${ev.event_type}</td>
-      <td>${ev.message}</td></tr>`).join("");
+      <td class="time" title="${esc(new Date(ev.timestamp).toLocaleString())}">${esc(whenText(ev.timestamp))}</td>
+      <td class="type"><span class="sev ${esc(ev.severity)}"></span>${esc(String(ev.event_type || "").replace(/_/g, " "))}</td>
+      <td>${esc(ev.message)}${ev.inverter_id ? ` <span class="chip">inverter ${esc(ev.inverter_id)}</span>` : ""}</td></tr>`).join("");
   } catch (e) { console.error("Error loading events:", e); }
 }
 
-function drawLineChart(canvasId, points, valueKey, unit) {
-  const canvas = document.getElementById(canvasId);
-  if (!canvas) return;
-  const ctx = canvas.getContext("2d");
-  const width = canvas.width, height = canvas.height;
-  const left = 72, right = 16, top = 16, bottom = 38;
-  const plotWidth = width - left - right, plotHeight = height - top - bottom;
-  ctx.clearRect(0, 0, width, height);
-
-  const valid = points.filter(p => Number.isFinite(Number(p[valueKey])) && Number.isFinite(new Date(p.timestamp).getTime()));
-  if (!valid.length) {
-    ctx.fillStyle = "#aaa"; ctx.font = "14px sans-serif";
-    ctx.fillText("No historical data for this range.", left, top + 20);
-    return;
-  }
-  const values = valid.map(p => Number(p[valueKey]));
-  const times = valid.map(p => new Date(p.timestamp).getTime());
-  let minValue = valueKey === "battery_soc" ? Math.min(...values) : 0;
-  let maxValue = Math.max(...values);
-  if (maxValue === minValue) maxValue = minValue + 1;
-  const minTime = Math.min(...times), maxTime = Math.max(...times);
-  const timeSpan = Math.max(maxTime - minTime, 1);
-
-  ctx.strokeStyle = "#555"; ctx.fillStyle = "#aaa"; ctx.lineWidth = 1; ctx.font = "12px sans-serif";
-  const decimals = unit.includes("kWh") ? 1 : 0;
-  for (let i = 0; i <= 4; i++) {
-    const y = top + plotHeight * i / 4;
-    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(width - right, y); ctx.stroke();
-    ctx.fillText((maxValue - (maxValue - minValue) * i / 4).toFixed(decimals) + " " + unit, 4, y + 4);
-  }
-
-  ctx.strokeStyle = "#ddd"; ctx.lineWidth = 2; ctx.beginPath();
-  let penDown = false;
-  for (const p of valid) {
-    const x = left + ((new Date(p.timestamp).getTime() - minTime) / timeSpan) * plotWidth;
-    const y = top + plotHeight - ((Number(p[valueKey]) - minValue) / (maxValue - minValue)) * plotHeight;
-    if (!penDown || p.gap_before) { ctx.moveTo(x, y); penDown = true; } else { ctx.lineTo(x, y); }
-  }
-  ctx.stroke();
-
-  const opts = historyHours <= 24 ? {month:"short", day:"numeric", hour:"2-digit", minute:"2-digit"}
-             : historyHours <= 744 ? {month:"short", day:"numeric"}
-             : {month:"short", day:"numeric", year:"numeric"};
-  const firstLabel = new Date(valid[0].timestamp).toLocaleString([], opts);
-  const lastLabel = new Date(valid[valid.length - 1].timestamp).toLocaleString([], opts);
-  ctx.fillStyle = "#aaa";
-  ctx.fillText(firstLabel, left, height - 9);
-  ctx.fillText(lastLabel, width - right - ctx.measureText(lastLabel).width, height - 9);
+// ----------------------------------------------------------------- charts
+function niceStep(range, target) {
+  const raw = range / Math.max(1, target), mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * mag >= raw) return m * mag;
+  return 10 * mag;
 }
+function axisFmt(v, unit, step) {
+  if (unit === "W") return Math.abs(v) >= 1000 ? (v / 1000).toFixed(v % 1000 === 0 ? 0 : 1) + " kW" : Math.round(v) + " W";
+  if (unit === "%") return Math.round(v) + "%";
+  return v.toFixed((step || 1) >= 1 ? 0 : 1) + " " + unit;
+}
+const DAY = 86400000, HOUR = 3600000;
+function timeTicks(minT, maxT, target) {
+  const span = maxT - minT, out = [];
+  const steps = [60000, 300000, 600000, 900000, 1800000, HOUR, 2 * HOUR, 3 * HOUR, 6 * HOUR, 12 * HOUR];
+  const sub = steps.find(s => span / s <= target);
+  if (sub) {
+    const tz = t => new Date(t).getTimezoneOffset() * 60000;
+    let t = Math.ceil((minT - tz(minT)) / sub) * sub + tz(minT);
+    for (; t <= maxT; t += sub) {
+      const d = new Date(t);
+      const midnight = d.getHours() === 0 && d.getMinutes() === 0;
+      out.push({t, label: midnight ? d.toLocaleDateString([], {month: "short", day: "numeric"})
+                                   : d.toLocaleTimeString([], {hour: "numeric", minute: sub >= HOUR ? undefined : "2-digit"})});
+    }
+    return out;
+  }
+  const d = new Date(minT); d.setHours(0, 0, 0, 0);
+  if (span / DAY <= target * 14) {
+    const stepDays = [1, 2, 7, 14].find(s => span / DAY / s <= target) || 14;
+    if (d.getTime() < minT) d.setDate(d.getDate() + 1);
+    for (; d.getTime() <= maxT; d.setDate(d.getDate() + stepDays))
+      out.push({t: d.getTime(), label: d.toLocaleDateString([], {month: "short", day: "numeric"})});
+    return out;
+  }
+  d.setDate(1);
+  const stepMonths = [1, 2, 3, 6, 12].find(s => span / (30.4 * DAY) / s <= target) || 12;
+  if (d.getTime() < minT) d.setMonth(d.getMonth() + 1);
+  for (; d.getTime() <= maxT; d.setMonth(d.getMonth() + stepMonths))
+    out.push({t: d.getTime(), label: d.toLocaleDateString([], stepMonths >= 12 ? {year: "numeric"} :
+      span > 400 * DAY || d.getMonth() === 0 ? {month: "short", year: "numeric"} : {month: "short"})});
+  return out;
+}
+
+class Chart {
+  constructor(canvasId, tipId, opts) {
+    this.canvas = $(canvasId); this.tip = $(tipId); this.opts = opts;
+    this.points = []; this.hover = null;
+    this.canvas.addEventListener("pointermove", e => this.onMove(e));
+    this.canvas.addEventListener("pointerleave", () => { this.hover = null; this.tip.style.display = "none"; this.draw(); });
+    new ResizeObserver(() => this.draw()).observe(this.canvas);
+  }
+  setData(points, series, unit, mode) {
+    this.points = points.filter(p => Number.isFinite(new Date(p.timestamp).getTime()));
+    this.times = this.points.map(p => new Date(p.timestamp).getTime());
+    this.series = series; this.unit = unit; this.mode = mode; this.hover = null;
+    this.draw();
+  }
+  layout() {
+    const dpr = window.devicePixelRatio || 1;
+    const w = this.canvas.clientWidth, h = this.canvas.clientHeight;
+    if (this.canvas.width !== Math.round(w * dpr) || this.canvas.height !== Math.round(h * dpr)) {
+      this.canvas.width = Math.round(w * dpr); this.canvas.height = Math.round(h * dpr);
+    }
+    const ctx = this.canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    return {ctx, w, h};
+  }
+  draw() {
+    const {ctx, w, h} = this.layout();
+    ctx.clearRect(0, 0, w, h);
+    ctx.font = "12px system-ui, sans-serif";
+    const pts = this.points || [], series = this.series || [];
+    const values = [];
+    for (const s of series) for (const p of pts) if (isNum(p[s.key])) values.push(Number(p[s.key]));
+    if (!values.length) {
+      ctx.fillStyle = css("--muted"); ctx.fillText("No historical data for this range.", 12, 24); return;
+    }
+    let lo = this.opts.yMin === "auto" ? Math.min(...values) : 0, hi = Math.max(...values);
+    if (this.opts.yMax !== undefined) hi = Math.max(hi, this.opts.yMax);
+    const step = niceStep(hi - lo || 1, 4);
+    lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step; if (hi === lo) hi = lo + step;
+    const yTicks = []; for (let v = lo; v <= hi + 1e-9; v += step) yTicks.push(v);
+    const labels = yTicks.map(v => axisFmt(v, this.unit, step));
+    const left = Math.ceil(Math.max(...labels.map(l => ctx.measureText(l).width))) + 12, right = 10, top = 10, bottom = 26;
+    const pw = w - left - right, ph = h - top - bottom;
+    const minT = Math.min(...this.times), maxT = Math.max(...this.times), span = Math.max(maxT - minT, 1);
+    const X = t => left + (t - minT) / span * pw, Y = v => top + ph - (v - lo) / (hi - lo) * ph;
+
+    ctx.strokeStyle = css("--line-2"); ctx.lineWidth = 1; ctx.fillStyle = css("--muted"); ctx.textBaseline = "middle";
+    for (let i = 0; i < yTicks.length; i++) {
+      const y = Math.round(Y(yTicks[i])) + 0.5;
+      ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(w - right, y); ctx.stroke();
+      ctx.textAlign = "right"; ctx.fillText(labels[i], left - 8, y);
+    }
+    ctx.textBaseline = "alphabetic"; ctx.textAlign = "center";
+    for (const tk of timeTicks(minT, maxT, Math.max(2, Math.floor(pw / 90)))) {
+      const x = Math.round(X(tk.t)) + 0.5;
+      ctx.strokeStyle = css("--line"); ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, top + ph); ctx.stroke();
+      ctx.fillText(tk.label, x, h - 8);
+    }
+
+    const bars = this.mode === "bars" && pts.length <= 130;
+    const slot = pw / Math.max(1, pts.length);
+    for (const s of series) {
+      const color = css(s.color);
+      if (bars && s.bars) {
+        const bw = Math.min(24, Math.max(1, slot - 2));
+        ctx.fillStyle = color;
+        for (let i = 0; i < pts.length; i++) {
+          if (!isNum(pts[i][s.key])) continue;
+          const x = X(this.times[i]) - bw / 2, y = Y(Number(pts[i][s.key])), b = Y(lo), r = Math.min(3, bw / 2);
+          ctx.beginPath(); ctx.moveTo(x, b); ctx.lineTo(x, y + r); ctx.arcTo(x, y, x + r, y, r);
+          ctx.lineTo(x + bw - r, y); ctx.arcTo(x + bw, y, x + bw, y + r, r); ctx.lineTo(x + bw, b); ctx.fill();
+        }
+        continue;
+      }
+      if (s.fill) {
+        ctx.fillStyle = color; ctx.globalAlpha = 0.12; ctx.beginPath(); let open = false, startX = 0;
+        for (let i = 0; i < pts.length; i++) {
+          const v = pts[i][s.key];
+          if (!isNum(v) || pts[i].gap_before) { if (open) { ctx.lineTo(X(this.times[i - 1]), Y(lo)); ctx.lineTo(startX, Y(lo)); ctx.closePath(); ctx.fill(); ctx.beginPath(); open = false; } if (!isNum(v)) continue; }
+          if (!open) { startX = X(this.times[i]); ctx.moveTo(startX, Y(lo)); open = true; }
+          ctx.lineTo(X(this.times[i]), Y(Number(v)));
+        }
+        if (open) { ctx.lineTo(X(this.times[pts.length - 1]), Y(lo)); ctx.closePath(); ctx.fill(); }
+        ctx.globalAlpha = 1;
+      }
+      ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.lineJoin = "round"; ctx.lineCap = "round"; ctx.beginPath();
+      let pen = false;
+      for (let i = 0; i < pts.length; i++) {
+        const v = pts[i][s.key];
+        if (!isNum(v)) { pen = false; continue; }
+        const x = X(this.times[i]), y = Y(Number(v));
+        if (!pen || pts[i].gap_before) { ctx.moveTo(x, y); pen = true; } else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+
+    if (this.hover !== null && pts[this.hover]) {
+      const i = this.hover, x = Math.round(X(this.times[i])) + 0.5;
+      ctx.strokeStyle = css("--muted"); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x, top); ctx.lineTo(x, top + ph); ctx.stroke();
+      for (const s of series) {
+        if (!isNum(pts[i][s.key])) continue;
+        ctx.beginPath(); ctx.arc(x, Y(Number(pts[i][s.key])), 4.5, 0, Math.PI * 2);
+        ctx.fillStyle = css("--surface"); ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = css(s.color); ctx.stroke();
+      }
+    }
+    this.geom = {left, pw, minT, span};
+  }
+  onMove(e) {
+    if (!this.points.length || !this.geom) return;
+    const rect = this.canvas.getBoundingClientRect();
+    const t = this.geom.minT + (e.clientX - rect.left - this.geom.left) / this.geom.pw * this.geom.span;
+    let best = 0, bd = Infinity;
+    for (let i = 0; i < this.times.length; i++) { const d = Math.abs(this.times[i] - t); if (d < bd) { bd = d; best = i; } }
+    if (best !== this.hover) { this.hover = best; this.draw(); }
+    const p = this.points[best], d = new Date(this.times[best]);
+    const tip = this.tip; tip.textContent = "";
+    const head = document.createElement("div"); head.className = "t";
+    head.textContent = this.mode === "bars" ? d.toLocaleDateString([], {weekday: "short", month: "short", day: "numeric", year: "numeric"})
+                                            : d.toLocaleString([], {month: "short", day: "numeric", hour: "numeric", minute: "2-digit"});
+    tip.appendChild(head);
+    for (const s of this.series) {
+      const row = document.createElement("div"); row.className = "r";
+      const sw = document.createElement("i"); sw.style.background = css(s.color);
+      const b = document.createElement("b"); b.textContent = isNum(p[s.key]) ? (this.unit === "W" ? watts(Number(p[s.key])) : axisFmt(Number(p[s.key]), this.unit)) : "--";
+      const l = document.createElement("span"); l.textContent = s.label;
+      row.append(sw, b, l); tip.appendChild(row);
+    }
+    tip.style.display = "block";
+    const cx = e.clientX - rect.left, cardRect = this.canvas.parentElement.getBoundingClientRect();
+    const tw = tip.offsetWidth, baseX = this.canvas.offsetLeft + cx;
+    tip.style.left = (baseX + 14 + tw > cardRect.width - 8 ? baseX - 14 - tw : baseX + 14) + "px";
+    tip.style.top = (this.canvas.offsetTop + 8) + "px";
+  }
+}
+
+const powerChart = new Chart("powerChart", "powerTip", {yMin: 0});
+const socChart = new Chart("socChart", "socTip", {yMin: "auto", yMax: 100});
 
 async function updateHistoryCharts() {
   try {
@@ -713,35 +944,41 @@ async function updateHistoryCharts() {
     if (!r.ok) throw new Error("HTTP " + r.status);
     const payload = await r.json();
     const points = payload.points || [];
-    const energyMode = payload.mode === "daily_energy";
-    document.getElementById("pvHistoryLabel").textContent = energyMode ? "Solar Energy per Day" : "Solar Production";
-    document.getElementById("loadHistoryLabel").textContent = energyMode ? "House Energy per Day" : "House Load";
-    drawLineChart("pvChart", points, "pv_value", payload.pv_unit || "W");
-    drawLineChart("loadChart", points, "load_value", payload.load_unit || "W");
-    drawLineChart("socChart", points, "battery_soc", "%");
+    const energy = payload.mode === "daily_energy";
+    $("powerTitle").textContent = energy ? "Energy per day" : "Power";
+    $("pvLegend").textContent = energy ? "Solar kWh" : "Solar";
+    $("loadLegend").textContent = energy ? "Load kWh" : "Load";
+    powerChart.setData(points, [
+      {key: "pv_value", color: "--solar", label: "solar", fill: true, bars: true},
+      {key: "load_value", color: "--load", label: "load"},
+    ], energy ? "kWh" : "W", energy ? "bars" : "line");
+    socChart.setData(points, [{key: "battery_soc", color: "--soc", label: "SOC", fill: true}], "%", "line");
   } catch (e) { console.error("Error loading history:", e); }
 }
 
 function setHistoryRange(hours) {
   historyHours = hours;
-  document.getElementById("historyTitle").textContent = LABELS[hours] || "History";
-  document.querySelectorAll(".history-range-button").forEach(b =>
-    b.classList.toggle("active", Number(b.dataset.hours) === hours));
+  $("historyTitle").textContent = LABELS[hours] || "History";
+  document.querySelectorAll("#ranges button").forEach(b => b.classList.toggle("active", Number(b.dataset.hours) === hours));
+  try { localStorage.setItem("solar.range", hours); } catch (e) {}
   updateHistoryCharts();
 }
-document.querySelectorAll(".history-range-button").forEach(b =>
-  b.addEventListener("click", () => setHistoryRange(Number(b.dataset.hours))));
+document.querySelectorAll("#ranges button").forEach(b => b.addEventListener("click", () => setHistoryRange(Number(b.dataset.hours))));
+try { const saved = Number(localStorage.getItem("solar.range")); if (LABELS[saved]) { historyHours = saved; } } catch (e) {}
+$("historyTitle").textContent = LABELS[historyHours];
+document.querySelectorAll("#ranges button").forEach(b => b.classList.toggle("active", Number(b.dataset.hours) === historyHours));
 
-updateDashboard(); updateSummary(); updateInverters(); updateEvents(); updateHistoryCharts();
-setInterval(updateDashboard, 10000);
-setInterval(updateSummary, 30000);
-setInterval(updateInverters, 10000);
-setInterval(updateEvents, 30000);
-setInterval(updateHistoryCharts, 60000);
+// Refresh only while the tab is visible so idle phones do not load the Pi.
+const every = (fn, ms) => setInterval(() => { if (!document.hidden) fn(); }, ms);
+function refreshAll() { updateDashboard(); updateSummary(); updateInverters(); updateEvents(); updateHistoryCharts(); }
+refreshAll();
+every(updateDashboard, 10000); every(updateInverters, 10000);
+every(updateSummary, 30000); every(updateEvents, 30000); every(updateHistoryCharts, 60000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshAll(); });
 </script>
 </body>
 </html>
-"""
+""".replace("__BASE_CSS__", BASE_CSS)
 
 
 DAYS_HTML = r"""<!DOCTYPE html>
@@ -749,65 +986,106 @@ DAYS_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Solar Monitor - Daily</title>
+<meta name="color-scheme" content="dark">
+<title>Solar Monitor · Daily</title>
 <style>
-  body { margin: 0; padding: 20px; background: #111; color: #eee; font-family: Arial, sans-serif; }
-  h1 { margin-top: 0; }
-  a { color: #9ecbff; }
-  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 14px; }
-  button, select { border: 1px solid #555; background: #222; color: #ddd; padding: 7px 12px; border-radius: 7px; cursor: pointer; }
-  .wrap { overflow-x: auto; background: #1b1b1b; border-radius: 10px; padding: 8px; }
-  table { border-collapse: collapse; width: 100%; font-size: 14px; white-space: nowrap; }
-  th, td { padding: 6px 10px; border-bottom: 1px solid #2a2a2a; text-align: right; }
-  th { color: #aaa; font-weight: normal; position: sticky; top: 0; background: #1b1b1b; }
-  td:first-child, th:first-child { text-align: left; }
-  .bar { display: inline-block; height: 8px; background: #f0b429; border-radius: 4px; vertical-align: middle; margin-left: 6px; }
+__BASE_CSS__
+  .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 0 0 14px; }
+  .controls label { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 8px; }
+  .tiles { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin-bottom: 14px; }
+  .tile { background: var(--surface); border-radius: 10px; padding: 12px 14px; }
+  .tile .label { color: var(--muted); font-size: 13px; }
+  .tile .value { margin-top: 4px; font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .tile .sub { margin-top: 2px; font-size: 12px; color: var(--muted); }
+  .wrap { overflow: auto; max-height: calc(100vh - 250px); min-height: 320px; background: var(--surface); border-radius: 10px; }
+  table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 13.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  th, td { padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: right; }
+  th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--surface); z-index: 1; font-size: 12.5px; }
+  th.group { text-align: center; border-bottom: 0; padding-bottom: 0; color: var(--faint); text-transform: uppercase; letter-spacing: 0.06em; font-size: 11px; }
+  thead tr:nth-child(2) th { top: 24px; }
+  td:first-child, th:first-child { text-align: left; position: sticky; left: 0; background: var(--surface); }
+  thead th:first-child { z-index: 2; }
+  tbody tr:hover td { background: var(--surface-2); }
+  td .wd { color: var(--muted); font-size: 12px; margin-left: 6px; }
+  .bar { display: inline-block; height: 7px; width: 64px; background: var(--surface-2); border-radius: 3px; vertical-align: middle; margin-left: 8px; overflow: hidden; }
+  .bar i { display: block; height: 100%; background: var(--solar); border-radius: 3px; }
+  .low { color: var(--bad); }
+  .dim { color: var(--faint); }
+  @media (max-width: 600px) { body { padding: 0 12px 24px; } .bar { display: none; } }
 </style>
 </head>
 <body>
-<h1>Daily Summary <a href="/" style="font-size:14px;font-weight:normal;margin-left:16px">Live dashboard</a></h1>
+<header class="topbar">
+  <div class="brand">Solar Monitor</div>
+  <nav><a href="/">Live</a><a href="/days" class="active">Daily table</a></nav>
+</header>
 <div class="controls">
   <label>Range <select id="range">
     <option value="30">30 days</option><option value="90" selected>90 days</option>
     <option value="365">1 year</option><option value="3660">All</option></select></label>
-  <a id="csv" href="/api/days.csv?days=90"><button>Download CSV</button></a>
+  <a class="btn" id="csv" href="/api/days.csv?days=90">Download CSV</a>
+  <span class="muted" id="count"></span>
 </div>
+<div class="tiles" id="totals"></div>
 <div class="wrap"><table>
-<thead><tr>
-  <th>Date</th><th>Solar kWh</th><th>Load kWh</th><th>Inv 1 kWh</th><th>Inv 2 kWh</th>
-  <th>Charge kWh</th><th>Discharge kWh</th><th>Peak PV W</th><th>Production h</th>
+<thead>
+<tr><th class="group"></th><th class="group" colspan="4">Energy, kWh</th><th class="group" colspan="2">Battery, kWh</th>
+    <th class="group" colspan="2">Production</th><th class="group" colspan="2">SOC</th><th class="group" colspan="2">Battery</th><th class="group" colspan="3">Performance</th></tr>
+<tr>
+  <th>Date</th><th>Solar</th><th>Load</th><th>Inv 1</th><th>Inv 2</th>
+  <th>Charge</th><th>Discharge</th><th>Peak W</th><th>Hours</th>
   <th>SOC min</th><th>SOC max</th><th>RTE</th><th>Cycles</th><th>Yield kWh/kW</th>
   <th>Insolation kWh/m²</th><th>PR</th>
 </tr></thead>
-<tbody id="rows"><tr><td>Loading...</td></tr></tbody>
+<tbody id="rows"><tr><td colspan="16" class="muted">Loading…</td></tr></tbody>
 </table></div>
 <script>
+"use strict";
 const k = v => v == null ? "--" : (v / 1000).toFixed(1);
 const n = (v, d, s) => v == null ? "--" : Number(v).toFixed(d) + (s || "");
 const pct = v => v == null ? "--" : (v * 100).toFixed(0) + "%";
+const dim = s => s === "--" ? '<span class="dim">--</span>' : s;
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const weekday = iso => new Date(iso + "T12:00:00").toLocaleDateString([], {weekday: "short"});
+const avg = xs => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null;
+function tile(label, value, sub) {
+  return `<div class="tile"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub || ""}</div></div>`;
+}
 async function load() {
   const days = document.getElementById("range").value;
   document.getElementById("csv").href = "/api/days.csv?days=" + days;
   const r = await fetch("/api/days?days=" + days);
   const rows = await r.json();
   const maxPv = Math.max(1, ...rows.map(x => x.pv_energy_wh || 0));
+  const pv = rows.map(x => x.pv_energy_wh).filter(v => v != null), ld = rows.map(x => x.load_energy_wh).filter(v => v != null);
+  const best = rows.reduce((b, x) => (x.pv_energy_wh || 0) > (b?.pv_energy_wh || 0) ? x : b, null);
+  const prs = rows.map(x => x.performance_ratio).filter(v => v != null), socs = rows.map(x => x.battery_soc_min).filter(v => v != null);
+  document.getElementById("count").textContent = rows.length ? rows.length + " completed days" : "";
+  document.getElementById("totals").innerHTML = rows.length ? [
+    tile("Solar total", k(pv.reduce((a, b) => a + b, 0)) + " kWh", "avg " + k(avg(pv)) + " kWh/day"),
+    tile("Load total", k(ld.reduce((a, b) => a + b, 0)) + " kWh", "avg " + k(avg(ld)) + " kWh/day"),
+    tile("Best day", best ? k(best.pv_energy_wh) + " kWh" : "--", best ? best.date : ""),
+    tile("Lowest SOC", socs.length ? Math.min(...socs).toFixed(0) + "%" : "--", "across the range"),
+    tile("Avg performance ratio", prs.length ? pct(avg(prs)) : "--", prs.length ? prs.length + " days with insolation" : "needs weather data"),
+  ].join("") : "";
   document.getElementById("rows").innerHTML = rows.length ? rows.map(x => `<tr>
-    <td>${x.date}</td>
-    <td>${k(x.pv_energy_wh)}<span class="bar" style="width:${Math.round(60 * (x.pv_energy_wh || 0) / maxPv)}px"></span></td>
-    <td>${k(x.load_energy_wh)}</td><td>${k(x.inverter_1_pv_wh)}</td><td>${k(x.inverter_2_pv_wh)}</td>
-    <td>${k(x.battery_charge_wh)}</td><td>${k(x.battery_discharge_wh)}</td>
-    <td>${n(x.pv_peak_watts, 0)}</td><td>${x.production_minutes == null ? "--" : (x.production_minutes / 60).toFixed(1)}</td>
-    <td>${n(x.battery_soc_min, 0, "%")}</td><td>${n(x.battery_soc_max, 0, "%")}</td>
-    <td>${pct(x.battery_round_trip_efficiency)}</td><td>${n(x.equivalent_battery_cycles, 2)}</td>
-    <td>${n(x.specific_yield_kwh_per_kw, 2)}</td><td>${k(x.insolation_wh_m2)}</td><td>${pct(x.performance_ratio)}</td>
-  </tr>`).join("") : "<tr><td>No completed days yet.</td></tr>";
+    <td>${esc(x.date)}<span class="wd">${weekday(x.date)}</span></td>
+    <td>${k(x.pv_energy_wh)}<span class="bar"><i style="width:${Math.round(100 * (x.pv_energy_wh || 0) / maxPv)}%"></i></span></td>
+    <td>${k(x.load_energy_wh)}</td><td>${dim(k(x.inverter_1_pv_wh))}</td><td>${dim(k(x.inverter_2_pv_wh))}</td>
+    <td>${dim(k(x.battery_charge_wh))}</td><td>${dim(k(x.battery_discharge_wh))}</td>
+    <td>${dim(n(x.pv_peak_watts, 0))}</td><td>${x.production_minutes == null ? dim("--") : (x.production_minutes / 60).toFixed(1)}</td>
+    <td class="${x.battery_soc_min != null && x.battery_soc_min < 30 ? "low" : ""}">${dim(n(x.battery_soc_min, 0, "%"))}</td>
+    <td>${dim(n(x.battery_soc_max, 0, "%"))}</td>
+    <td>${dim(pct(x.battery_round_trip_efficiency))}</td><td>${dim(n(x.equivalent_battery_cycles, 2))}</td>
+    <td>${dim(n(x.specific_yield_kwh_per_kw, 2))}</td><td>${dim(k(x.insolation_wh_m2))}</td><td>${dim(pct(x.performance_ratio))}</td>
+  </tr>`).join("") : '<tr><td colspan="16" class="muted">No completed days yet.</td></tr>';
 }
 document.getElementById("range").addEventListener("change", load);
 load();
 </script>
 </body>
 </html>
-"""
+""".replace("__BASE_CSS__", BASE_CSS)
 
 
 if __name__ == "__main__":

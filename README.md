@@ -167,13 +167,15 @@ Raw samples are deleted only after the aggregator has verified that every affect
 
 `app.py` serves the dashboard on port 5000 by default, with:
 
-- Live system and per-inverter cards including mode, fault code, temperature, and both PV strings
+- Live tiles for solar, load, battery (SOC bar, voltage, charge or discharge rate) and AC input, with today's and yesterday's energy under each
 - Energy today (completed quarter-hours plus the raw tail, cheap on a Pi 1) and yesterday, lowest SOC, yesterday's performance ratio
 - Battery runtime: hours to empty while discharging or to full while charging, from `battery_capacity_kwh`
-- A daily table at `/days` with per-inverter energy, peaks, production hours, SOC range, round-trip efficiency, cycles, yield, insolation, and performance ratio, downloadable as CSV
-- A stale-telemetry banner when the last reading is older than `SOLAR_STALE_AFTER` seconds
-- History from 1 hour to 3 years, automatically choosing raw, minute, 15-minute, or daily data, with gap markers for outages
-- Recent events
+- One compact card per inverter: mode, fault, output, both PV strings, AC output, battery voltage, temperature
+- A daily table at `/days` with range totals, per-inverter energy, peaks, production hours, SOC range, round-trip efficiency, cycles, yield, insolation, and performance ratio, downloadable as CSV
+- A stale-telemetry banner (and dimmed live values) when the last reading is older than `SOLAR_STALE_AFTER` seconds
+- History from 1 hour to 3 years, automatically choosing raw, minute, 15-minute, or daily data, with gap markers for outages. Solar and load share one chart with a hover readout; ranges of three months and longer switch to energy per day. The selected range is remembered in the browser
+- Recent events with plain-language types and relative times
+- Refreshes pause while the browser tab is hidden, so idle phones do not load the Pi. The pages use no external scripts or fonts and work with no internet access
 
 API endpoints: `/api/latest`, `/api/summary`, `/api/inverters`, `/api/events?limit=N`, `/api/history?hours=N`, `/api/days?days=N`, `/api/days.csv?days=N`, and `/healthz` (503 when telemetry is stale).
 
