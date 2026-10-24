@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Solar Monitor weather fetch hourly
+
+[Timer]
+OnBootSec=5min
+OnCalendar=hourly
+RandomizedDelaySec=5min
+Persistent=true
+Unit=solar-weather.service
+
+[Install]
+WantedBy=timers.target

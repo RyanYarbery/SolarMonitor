@@ -4,7 +4,11 @@ After=network.target
 RequiresMountsFor=/opt/solar-monitor
 
 [Service]
-Type=simple
+# Type=notify: the collector reports READY and pings the watchdog each cycle,
+# so a hung serial read gets the service restarted instead of going stale.
+Type=notify
+NotifyAccess=main
+WatchdogSec=90
 User=solar
 WorkingDirectory=/opt/solar-monitor
 EnvironmentFile=-/etc/solar-monitor.env

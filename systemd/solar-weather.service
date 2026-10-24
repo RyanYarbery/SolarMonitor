@@ -1,0 +1,13 @@
+[Unit]
+Description=Fetch hourly irradiance for Solar Monitor
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/opt/solar-monitor
+
+[Service]
+Type=oneshot
+User=solar
+WorkingDirectory=/opt/solar-monitor
+EnvironmentFile=-/etc/solar-monitor.env
+ExecStart=/opt/solar-monitor/.venv/bin/python /opt/solar-monitor/weather.py
+TimeoutStartSec=2min

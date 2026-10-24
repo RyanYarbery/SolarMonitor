@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly Solar Monitor database backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=10min
+Persistent=true
+Unit=solar-backup.service
+
+[Install]
+WantedBy=timers.target

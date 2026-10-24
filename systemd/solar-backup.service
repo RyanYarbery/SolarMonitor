@@ -1,0 +1,13 @@
+[Unit]
+Description=Solar Monitor database backup
+RequiresMountsFor=/opt/solar-monitor
+
+[Service]
+Type=oneshot
+User=solar
+WorkingDirectory=/opt/solar-monitor
+EnvironmentFile=-/etc/solar-monitor.env
+ExecStart=/opt/solar-monitor/.venv/bin/python /opt/solar-monitor/backup.py
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=45min
