@@ -16,6 +16,9 @@ KEYS = {
     "installed_pv_kw": "Installed PV array size in kW (enables specific yield and capacity factor)",
     "battery_capacity_kwh": "Usable battery capacity in kWh (enables equivalent cycle counts)",
     "production_threshold_watts": "PV watts above which the day counts as producing",
+    "low_soc_alert_percent": "Battery SOC below which a low-battery alert is sent",
+    "latitude": "Site latitude in decimal degrees (enables weather normalisation)",
+    "longitude": "Site longitude in decimal degrees",
 }
 
 
@@ -33,7 +36,8 @@ def main(argv):
             print("Known keys:", ", ".join(KEYS))
             return 2
         key, value = argv
-        float(value)  # validate numeric
+        if value != "":
+            float(value)  # validate numeric; empty string clears
         with conn:
             conn.execute(
                 """

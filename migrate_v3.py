@@ -1,7 +1,9 @@
 """Migrate an existing database to schema v3.
 
 Changes:
-  * inverter_samples gains mode and fault_code columns
+  * inverter_samples gains mode, fault_code and per-string PV columns
+  * daily_summary gains insolation_wh_m2
+  * alert_state table for notification cooldowns
   * daily_inverter_summary is created if the v2 migration never ran
   * every stored timestamp is converted from naive local time to UTC
     ("YYYY-MM-DDTHH:MM:SS+00:00"); rows that collide after conversion
@@ -54,12 +56,41 @@ def table_exists(conn, table):
     )
 
 
+NEW_INVERTER_COLUMNS = {
+    "mode": "TEXT",
+    "fault_code": "TEXT",
+    "pv1_voltage": "REAL",
+    "pv1_current": "REAL",
+    "pv1_watts": "REAL",
+    "pv2_voltage": "REAL",
+    "pv2_current": "REAL",
+    "pv2_watts": "REAL",
+}
+
+
 def add_columns(conn):
     existing = columns(conn, "inverter_samples")
-    for col in ("mode", "fault_code"):
+    for col, col_type in NEW_INVERTER_COLUMNS.items():
         if col not in existing:
-            conn.execute(f"ALTER TABLE inverter_samples ADD COLUMN {col} TEXT")
+            conn.execute(f"ALTER TABLE inverter_samples ADD COLUMN {col} {col_type}")
             print(f"Added inverter_samples.{col}")
+
+
+def add_daily_columns(conn):
+    existing = columns(conn, "daily_summary")
+    if "insolation_wh_m2" not in existing:
+        conn.execute("ALTER TABLE daily_summary ADD COLUMN insolation_wh_m2 REAL")
+        print("Added daily_summary.insolation_wh_m2")
+
+
+def ensure_alert_state(conn):
+    if table_exists(conn, "alert_state"):
+        return
+    conn.execute(
+        "CREATE TABLE alert_state (key TEXT PRIMARY KEY, last_sent TEXT NOT NULL, "
+        "active INTEGER NOT NULL DEFAULT 0)"
+    )
+    print("Created alert_state")
 
 
 def ensure_daily_inverter_summary(conn):
@@ -129,11 +160,19 @@ def main():
         conn.execute("PRAGMA busy_timeout=30000;")
 
         add_columns(conn)
+        add_daily_columns(conn)
         ensure_daily_inverter_summary(conn)
+        ensure_alert_state(conn)
         for table, cols in TIMESTAMP_COLUMNS:
             convert_timestamps(conn, table, cols)
 
+        import init_db
+
         with conn:
+            for key, value in init_db.DEFAULT_CONFIG.items():
+                conn.execute(
+                    "INSERT OR IGNORE INTO system_config (key, value) VALUES (?, ?)", (key, value)
+                )
             conn.executemany(
                 "DELETE FROM system_config WHERE key = ?",
                 [(k,) for k in OBSOLETE_CONFIG_KEYS],

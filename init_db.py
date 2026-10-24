@@ -42,6 +42,13 @@ CREATE TABLE IF NOT EXISTS inverter_samples (
     pv_current REAL,
     pv_watts REAL,
 
+    pv1_voltage REAL,
+    pv1_current REAL,
+    pv1_watts REAL,
+    pv2_voltage REAL,
+    pv2_current REAL,
+    pv2_watts REAL,
+
     mode TEXT,
     fault_code TEXT,
     status TEXT,
@@ -160,6 +167,13 @@ CREATE INDEX IF NOT EXISTS idx_events_type
 ON events(event_type);
 
 
+CREATE TABLE IF NOT EXISTS alert_state (
+    key TEXT PRIMARY KEY,
+    last_sent TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 0
+);
+
+
 CREATE TABLE IF NOT EXISTS minute_summary (
     timestamp TEXT PRIMARY KEY,
 
@@ -238,6 +252,7 @@ CREATE TABLE IF NOT EXISTS daily_summary (
     specific_yield_kwh_per_kw REAL,
     capacity_factor REAL,
 
+    insolation_wh_m2 REAL,
     weather_normalized_ratio REAL,
     performance_ratio REAL
 );
@@ -337,6 +352,9 @@ DEFAULT_CONFIG = {
     "production_threshold_watts": "100",
     "installed_pv_kw": "0",
     "battery_capacity_kwh": "0",
+    "low_soc_alert_percent": "20",
+    "latitude": "",
+    "longitude": "",
 }
 
 
