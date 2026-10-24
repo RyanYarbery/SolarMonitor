@@ -7,5 +7,6 @@ RequiresMountsFor=/opt/solar-monitor
 Type=oneshot
 User=solar
 WorkingDirectory=/opt/solar-monitor
+EnvironmentFile=-/etc/solar-monitor.env
 ExecStart=/opt/solar-monitor/.venv/bin/python /opt/solar-monitor/aggregator.py
 TimeoutStartSec=4min
