@@ -1,197 +1,77 @@
+"""Poll the EG4 inverter pair and record telemetry.
+
+Each cycle writes one row per inverter plus one combined system row in a
+single short transaction, publishes a live JSON snapshot, and records
+mode/fault transitions in the events table.
+"""
+
 import json
-import math
 import os
-import random
 import sqlite3
 import time
-from datetime import datetime
-from pathlib import Path
-from eg4 import get_all_parallel_status, get_status, get_pv2_status
+import traceback
 
-DB_PATH = Path("solar_v1.db")
-LIVE_PATH = Path("/run/solar-monitor/latest.json")
+import settings
+from eg4 import EG4Serial
+from timeutil import now_utc, to_iso
 
-SAMPLE_INTERVAL = 10
+# Consecutive read failures before a telemetry_lost event is recorded.
+FAILURE_EVENT_THRESHOLD = 6
 
+NO_FAULT = ("", "00", "0")
 
 
 def connect_db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(settings.DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=30000;")
     return conn
 
 
-def get_mock_inverter_readings():
-    now = datetime.now()
-    hour = now.hour + now.minute / 60 + now.second / 3600
+# ------------------------------------------------------------------- readings
 
-    daylight_start = 6.0
-    daylight_end = 20.0
 
-    if daylight_start <= hour <= daylight_end:
-        progress = (hour - daylight_start) / (
-            daylight_end - daylight_start
-        )
-        solar_curve = max(
-            0.0,
-            math.sin(math.pi * progress),
-        )
-    else:
-        solar_curve = 0.0
+def read_inverters(link):
+    """Return one reading dict per inverter from the parallel queries.
+
+    QPGS0/QPGS1 describe both units. The serial cable is attached to QPGS
+    index 0, so QPIGS/QPIGS2 give that unit's directly measured PV charging
+    power; the other unit's PV is estimated from voltage * current.
+    """
+    statuses = link.get_all_parallel_status()
+    direct_status = link.get_status()
+    direct_pv2 = link.get_pv2_status()
+    direct_pv_watts = direct_status["pv_charging_power"] + direct_pv2["pv2_watts"]
 
     readings = []
+    for index, status in enumerate(statuses):
+        pv1_w = status["pv1_voltage"] * status["pv1_current"]
+        pv2_w = status["pv2_voltage"] * status["pv2_current"]
 
-    for inverter_id in (1, 2):
-        pv_watts = (
-            solar_curve
-            * 5500
-            * random.uniform(0.93, 1.07)
-            * random.uniform(0.85, 1.05)
-        )
+        active_voltages = [
+            v
+            for v, i in (
+                (status["pv1_voltage"], status["pv1_current"]),
+                (status["pv2_voltage"], status["pv2_current"]),
+            )
+            if i > 0
+        ]
+        if active_voltages:
+            pv_voltage = sum(active_voltages) / len(active_voltages)
+        else:
+            pv_voltage = max(status["pv1_voltage"], status["pv2_voltage"])
 
-        if pv_watts < 20:
-            pv_watts = 0.0
-
-        load_watts = random.uniform(700, 1800)
-        battery_voltage = random.uniform(50.5, 53.5)
-        battery_soc = random.uniform(55, 95)
-
-        battery_charge_amps = max(
-            0.0,
-            (pv_watts - load_watts)
-            / max(battery_voltage, 1),
-        )
-
-        battery_discharge_amps = max(
-            0.0,
-            (load_watts - pv_watts)
-            / max(battery_voltage, 1),
-        )
-
-        inverter_temperature_c = (
-            31
-            + (pv_watts / 5500) * 18
-            + random.uniform(-2, 2)
-        )
-
-        pv_voltage = (
-            random.uniform(280, 390)
-            if pv_watts > 0
-            else 0.0
-        )
-
-        pv_current = (
-            pv_watts / pv_voltage
-            if pv_voltage > 0
-            else 0.0
-        )
+        if index == 0:
+            pv_watts, pv_quality = direct_pv_watts, "measured"
+            temperature = direct_status["temperature_c"]
+        else:
+            pv_watts, pv_quality = pv1_w + pv2_w, "estimated"
+            temperature = None
 
         readings.append(
             {
-                "inverter_id": inverter_id,
-                "grid_voltage": 0.0,
-                "grid_frequency": 0.0,
-                "output_voltage": random.uniform(118, 122),
-                "output_frequency": random.uniform(59.9, 60.1),
-                "output_va": (
-                    load_watts
-                    * random.uniform(1.00, 1.08)
-                ),
-                "output_watts": load_watts,
-                "load_percent": (
-                    load_watts / 6500
-                ) * 100,
-                "battery_voltage": battery_voltage,
-                "battery_charge_amps": battery_charge_amps,
-                "battery_discharge_amps": battery_discharge_amps,
-                "battery_soc": battery_soc,
-                "inverter_temperature_c": inverter_temperature_c,
-                "pv_voltage": pv_voltage,
-                "pv_current": pv_current,
-                "pv_watts": pv_watts,
-                "status": "mock",
-            }
-        )
-
-    return readings
-
-
-
-def get_real_inverter_readings():
-    # QPGS0/QPGS1 expose both parallel inverters.
-    statuses = get_all_parallel_status()
-
-    # The serial cable is physically attached to QPGS index 0.
-    # QPIGS gives direct PV1 charging power and QPIGS2 gives
-    # direct PV2 charging power for this inverter.
-    direct_status = get_status()
-    direct_pv2 = get_pv2_status()
-
-    direct_pv_watts = (
-        direct_status["pv_charging_power"]
-        + direct_pv2["pv2_watts"]
-    )
-
-    readings = []
-
-    for inverter_index, status in enumerate(statuses):
-        inverter_id = inverter_index + 1
-
-        pv1_estimated_watts = (
-            status["pv1_voltage"]
-            * status["pv1_current"]
-        )
-
-        pv2_estimated_watts = (
-            status["pv2_voltage"]
-            * status["pv2_current"]
-        )
-
-        estimated_pv_watts = (
-            pv1_estimated_watts
-            + pv2_estimated_watts
-        )
-
-        pv_current = (
-            status["pv1_current"]
-            + status["pv2_current"]
-        )
-
-        active_pv_voltages = []
-
-        if status["pv1_current"] > 0:
-            active_pv_voltages.append(
-                status["pv1_voltage"]
-            )
-
-        if status["pv2_current"] > 0:
-            active_pv_voltages.append(
-                status["pv2_voltage"]
-            )
-
-        if active_pv_voltages:
-            pv_voltage = (
-                sum(active_pv_voltages)
-                / len(active_pv_voltages)
-            )
-        else:
-            pv_voltage = max(
-                status["pv1_voltage"],
-                status["pv2_voltage"],
-            )
-
-        if inverter_index == 0:
-            pv_watts = direct_pv_watts
-            pv_quality = "measured"
-        else:
-            pv_watts = estimated_pv_watts
-            pv_quality = "estimated"
-
-        readings.append(
-            {
-                "inverter_id": inverter_id,
+                "inverter_id": index + 1,
                 "grid_voltage": status["grid_voltage"],
                 "grid_frequency": status["grid_frequency"],
                 "output_voltage": status["output_voltage"],
@@ -200,168 +80,102 @@ def get_real_inverter_readings():
                 "output_watts": status["output_watts"],
                 "load_percent": status["load_percent"],
                 "battery_voltage": status["battery_voltage"],
-                "battery_charge_amps": (
-                    status["battery_charge_current"]
-                ),
-                "battery_discharge_amps": (
-                    status["battery_discharge_current"]
-                ),
+                "battery_charge_amps": status["battery_charge_current"],
+                "battery_discharge_amps": status["battery_discharge_current"],
                 "battery_soc": status["battery_soc"],
-                "inverter_temperature_c": None,
+                "inverter_temperature_c": temperature,
                 "pv_voltage": pv_voltage,
-                "pv_current": pv_current,
+                "pv_current": status["pv1_current"] + status["pv2_current"],
                 "pv_watts": pv_watts,
-                "reported_total_output_watts": (
-                    status["total_output_watts"]
-                ),
-                "status": (
-                    f"eg4_serial_parallel:"
-                    f"{status['mode']}:"
-                    f"pv_{pv_quality}"
-                ),
+                "pv_quality": pv_quality,
+                "mode": status["mode"],
+                "fault_code": status["fault_code"],
+                "reported_total_output_watts": status["total_output_watts"],
+                "status": f"eg4_serial_parallel:{status['mode']}:pv_{pv_quality}",
             }
         )
-
     return readings
 
 
 def build_system_sample(inverters):
-    total_pv = sum(
-        i["pv_watts"]
-        for i in inverters
-    )
+    total_pv = sum(i["pv_watts"] for i in inverters)
 
-    # Each QPGS response contains the parallel system's
-    # combined output. Because QPGS0/QPGS1 are queried
-    # sequentially, average their reported totals.
-    reported_loads = [
+    # Each QPGS response carries the parallel system's combined output.
+    # The two are queried sequentially, so average them.
+    reported = [
         i["reported_total_output_watts"]
         for i in inverters
         if i.get("reported_total_output_watts") is not None
     ]
-
-    if reported_loads:
-        total_load = (
-            sum(reported_loads)
-            / len(reported_loads)
-        )
+    if reported:
+        total_load = sum(reported) / len(reported)
     else:
-        total_load = sum(
-            i["output_watts"]
-            for i in inverters
-        )
+        total_load = sum(i["output_watts"] for i in inverters)
 
-    battery_voltage = (
-        sum(
-            i["battery_voltage"]
-            for i in inverters
-        )
-        / len(inverters)
-    )
-
-    battery_soc = (
-        sum(
-            i["battery_soc"]
-            for i in inverters
-        )
-        / len(inverters)
-    )
-
-    total_charge_watts = sum(
-        i["battery_charge_amps"]
-        * i["battery_voltage"]
-        for i in inverters
-    )
-
-    total_discharge_watts = sum(
-        i["battery_discharge_amps"]
-        * i["battery_voltage"]
-        for i in inverters
-    )
-
-    # We can assert zero grid power when neither inverter
-    # sees AC input. When grid is present, QPGS does not
-    # provide a trustworthy grid-watt value.
-    if all(
-        i["grid_voltage"] < 1.0
-        for i in inverters
-    ):
-        grid_watts = 0.0
-    else:
-        grid_watts = 0.0
+    n = len(inverters)
+    battery_voltage = sum(i["battery_voltage"] for i in inverters) / n
+    battery_soc = sum(i["battery_soc"] for i in inverters) / n
+    charge_w = sum(i["battery_charge_amps"] * i["battery_voltage"] for i in inverters)
+    discharge_w = sum(i["battery_discharge_amps"] * i["battery_voltage"] for i in inverters)
 
     return {
         "total_pv_watts": total_pv,
         "total_load_watts": total_load,
         "battery_voltage": battery_voltage,
         "battery_soc": battery_soc,
-        "battery_watts": (
-            total_charge_watts
-            - total_discharge_watts
-        ),
-        "grid_watts": grid_watts,
-        "inverter_count": len(inverters),
+        "battery_watts": charge_w - discharge_w,
+        # QPGS exposes no trustworthy grid power figure. Stored as NULL
+        # (unknown) rather than a misleading zero.
+        "grid_watts": None,
+        "inverter_count": n,
         "source": "eg4_serial_parallel",
+        "any_fault": any(i["fault_code"] not in NO_FAULT for i in inverters),
+        "modes": {i["inverter_id"]: i["mode"] for i in inverters},
     }
 
-def insert_inverter_samples(
-    conn,
-    timestamp,
-    inverters,
-):
+
+# -------------------------------------------------------------------- storage
+
+
+def _r(value, digits):
+    return None if value is None else round(value, digits)
+
+
+def insert_inverter_samples(conn, timestamp, inverters):
     conn.executemany(
         """
         INSERT INTO inverter_samples (
-            timestamp,
-            inverter_id,
-            grid_voltage,
-            grid_frequency,
-            output_voltage,
-            output_frequency,
-            output_va,
-            output_watts,
+            timestamp, inverter_id,
+            grid_voltage, grid_frequency,
+            output_voltage, output_frequency, output_va, output_watts,
             load_percent,
-            battery_voltage,
-            battery_charge_amps,
-            battery_discharge_amps,
-            battery_soc,
-            inverter_temperature_c,
-            pv_voltage,
-            pv_current,
-            pv_watts,
-            status
-        )
-        VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?, ?
-        )
+            battery_voltage, battery_charge_amps, battery_discharge_amps,
+            battery_soc, inverter_temperature_c,
+            pv_voltage, pv_current, pv_watts,
+            mode, fault_code, status
+        ) VALUES (?,?, ?,?, ?,?,?,?, ?, ?,?,?, ?,?, ?,?,?, ?,?,?)
         """,
         [
             (
                 timestamp,
                 i["inverter_id"],
-                round(i["grid_voltage"], 2),
-                round(i["grid_frequency"], 2),
-                round(i["output_voltage"], 2),
-                round(i["output_frequency"], 2),
-                round(i["output_va"], 1),
-                round(i["output_watts"], 1),
-                round(i["load_percent"], 1),
-                round(i["battery_voltage"], 2),
-                round(i["battery_charge_amps"], 2),
-                round(i["battery_discharge_amps"], 2),
-                round(i["battery_soc"], 1),
-                (
-                    round(
-                        i["inverter_temperature_c"],
-                        1,
-                    )
-                    if i["inverter_temperature_c"] is not None
-                    else None
-                ),
-                round(i["pv_voltage"], 1),
-                round(i["pv_current"], 2),
-                round(i["pv_watts"], 1),
+                _r(i["grid_voltage"], 2),
+                _r(i["grid_frequency"], 2),
+                _r(i["output_voltage"], 2),
+                _r(i["output_frequency"], 2),
+                _r(i["output_va"], 1),
+                _r(i["output_watts"], 1),
+                _r(i["load_percent"], 1),
+                _r(i["battery_voltage"], 2),
+                _r(i["battery_charge_amps"], 2),
+                _r(i["battery_discharge_amps"], 2),
+                _r(i["battery_soc"], 1),
+                _r(i["inverter_temperature_c"], 1),
+                _r(i["pv_voltage"], 1),
+                _r(i["pv_current"], 2),
+                _r(i["pv_watts"], 1),
+                i["mode"],
+                i["fault_code"],
                 i["status"],
             )
             for i in inverters
@@ -369,211 +183,233 @@ def insert_inverter_samples(
     )
 
 
-def insert_system_sample(
-    conn,
-    timestamp,
-    sample,
-):
+def insert_system_sample(conn, timestamp, sample):
     conn.execute(
         """
         INSERT INTO system_samples (
-            timestamp,
-            total_pv_watts,
-            total_load_watts,
-            battery_voltage,
-            battery_soc,
-            battery_watts,
-            grid_watts,
-            inverter_count,
-            source
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            timestamp, total_pv_watts, total_load_watts,
+            battery_voltage, battery_soc, battery_watts,
+            grid_watts, inverter_count, source
+        ) VALUES (?,?,?,?,?,?,?,?,?)
         """,
         (
             timestamp,
-            round(
-                sample["total_pv_watts"],
-                1,
-            ),
-            round(
-                sample["total_load_watts"],
-                1,
-            ),
-            round(
-                sample["battery_voltage"],
-                2,
-            ),
-            round(
-                sample["battery_soc"],
-                1,
-            ),
-            round(
-                sample["battery_watts"],
-                1,
-            ),
-            round(
-                sample["grid_watts"],
-                1,
-            ),
+            _r(sample["total_pv_watts"], 1),
+            _r(sample["total_load_watts"], 1),
+            _r(sample["battery_voltage"], 2),
+            _r(sample["battery_soc"], 1),
+            _r(sample["battery_watts"], 1),
+            _r(sample["grid_watts"], 1),
             sample["inverter_count"],
             sample["source"],
         ),
     )
 
 
-def write_live_sample(
-    timestamp,
-    sample,
-):
-    live_data = {
-        "timestamp": timestamp,
-        "pv_watts": round(
-            sample["total_pv_watts"],
-            1,
-        ),
-        "load_watts": round(
-            sample["total_load_watts"],
-            1,
-        ),
-        "battery_voltage": round(
-            sample["battery_voltage"],
-            2,
-        ),
-        "battery_soc": round(
-            sample["battery_soc"],
-            1,
-        ),
-        "battery_watts": round(
-            sample["battery_watts"],
-            1,
-        ),
-        "grid_watts": round(
-            sample["grid_watts"],
-            1,
-        ),
-        "inverter_count": (
-            sample["inverter_count"]
-        ),
-        "source": sample["source"],
-    }
-
-    temp_path = LIVE_PATH.with_suffix(
-        ".tmp"
+def record_event(conn, timestamp, event_type, message, severity="info", inverter_id=None):
+    conn.execute(
+        """
+        INSERT INTO events (timestamp, event_type, severity, source, inverter_id, message)
+        VALUES (?, ?, ?, 'collector', ?, ?)
+        """,
+        (timestamp, event_type, severity, inverter_id, message),
     )
 
-    with temp_path.open("w") as file:
-        json.dump(live_data, file)
 
-    os.replace(
-        temp_path,
-        LIVE_PATH,
-    )
+class StateTracker:
+    """Detects per-inverter mode and fault transitions between cycles."""
+
+    def __init__(self):
+        self.last = {}  # inverter_id -> (mode, fault_code)
+
+    def events_for(self, inverters):
+        events = []
+        for i in inverters:
+            key = i["inverter_id"]
+            current = (i["mode"], i["fault_code"])
+            previous = self.last.get(key)
+            if previous is None:
+                self.last[key] = current
+                continue
+            if current == previous:
+                continue
+            old_mode, old_fault = previous
+            mode, fault = current
+            if mode != old_mode:
+                events.append(
+                    (
+                        "mode_change",
+                        f"Inverter {key} mode {old_mode} -> {mode}",
+                        "warning" if mode == "F" else "info",
+                        key,
+                    )
+                )
+            if fault != old_fault:
+                if fault in NO_FAULT:
+                    events.append(
+                        ("fault_cleared", f"Inverter {key} fault {old_fault} cleared", "info", key)
+                    )
+                else:
+                    events.append(("fault", f"Inverter {key} fault code {fault}", "error", key))
+            self.last[key] = current
+        return events
+
+
+# ------------------------------------------------------------------ live file
+
+
+class LiveWriter:
+    def __init__(self, path=settings.LIVE_PATH):
+        self.path = path
+        self.enabled = True
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.enabled = False
+            print(
+                f"Live snapshot disabled: cannot create {self.path.parent} ({exc}). "
+                "Add RuntimeDirectory=solar-monitor to the systemd unit.",
+                flush=True,
+            )
+
+    def write(self, timestamp, sample, inverters):
+        if not self.enabled:
+            return
+        data = {
+            "timestamp": timestamp,
+            "pv_watts": _r(sample["total_pv_watts"], 1),
+            "load_watts": _r(sample["total_load_watts"], 1),
+            "battery_voltage": _r(sample["battery_voltage"], 2),
+            "battery_soc": _r(sample["battery_soc"], 1),
+            "battery_watts": _r(sample["battery_watts"], 1),
+            "grid_watts": _r(sample["grid_watts"], 1),
+            "inverter_count": sample["inverter_count"],
+            "source": sample["source"],
+            "any_fault": sample["any_fault"],
+            "inverters": [
+                {
+                    "inverter_id": i["inverter_id"],
+                    "mode": i["mode"],
+                    "fault_code": i["fault_code"],
+                    "pv_watts": _r(i["pv_watts"], 1),
+                    "pv_quality": i["pv_quality"],
+                    "output_watts": _r(i["output_watts"], 1),
+                }
+                for i in inverters
+            ],
+        }
+        tmp = self.path.with_suffix(".tmp")
+        try:
+            with tmp.open("w") as f:
+                json.dump(data, f)
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            print(f"Live snapshot write failed: {exc}", flush=True)
+
+
+# ----------------------------------------------------------------------- main
 
 
 def main():
-    if not DB_PATH.exists():
-        raise FileNotFoundError(
-            f"{DB_PATH} does not exist. "
-            "Run init_db.py first."
-        )
+    if not settings.DB_PATH.exists():
+        raise FileNotFoundError(f"{settings.DB_PATH} does not exist. Run init_db.py first.")
 
     conn = connect_db()
+    link = EG4Serial()
+    live = LiveWriter()
+    tracker = StateTracker()
+    failures = 0
+    lost_reported = False
 
-    print(
-        "EG4 solar collector v2 started."
-    )
-    print("Database:", DB_PATH)
-    print("Mode: EG4 SERIAL PARALLEL")
-    print(
-        f"Sampling every "
-        f"{SAMPLE_INTERVAL} seconds."
-    )
+    print("EG4 solar collector v3 started.")
+    print("Database:", settings.DB_PATH)
+    print("Serial:", link.port, "@", link.baud)
+    print(f"Sampling every {settings.SAMPLE_INTERVAL} seconds.", flush=True)
 
     try:
         while True:
-            timestamp = (
-                datetime.now().isoformat(
-                    timespec="seconds"
-                )
-            )
+            cycle_started = time.monotonic()
+            timestamp = to_iso(now_utc())
 
             try:
-                inverter_readings = (
-                    get_real_inverter_readings()
-                )
+                inverters = read_inverters(link)
             except Exception as exc:
-                print(
-                    f"EG4 parallel read failed: {exc}",
-                    flush=True,
-                )
-                time.sleep(SAMPLE_INTERVAL)
+                failures += 1
+                print(f"EG4 read failed ({failures}): {exc}", flush=True)
+                if failures >= FAILURE_EVENT_THRESHOLD and not lost_reported:
+                    try:
+                        with conn:
+                            record_event(
+                                conn,
+                                timestamp,
+                                "telemetry_lost",
+                                f"{failures} consecutive read failures: {exc}",
+                                "warning",
+                            )
+                        lost_reported = True
+                    except sqlite3.Error as db_exc:
+                        print(f"Event write failed: {db_exc}", flush=True)
+                _sleep_remaining(cycle_started)
                 continue
 
-            system_sample = (
-                build_system_sample(
-                    inverter_readings
-                )
-            )
+            if lost_reported:
+                lost_reported = False
+                recovered = failures
+                failures = 0
+                pending_events = [
+                    (
+                        "telemetry_restored",
+                        f"Telemetry restored after {recovered} failures",
+                        "info",
+                        None,
+                    )
+                ]
+            else:
+                failures = 0
+                pending_events = []
+
+            system = build_system_sample(inverters)
+            pending_events.extend(tracker.events_for(inverters))
 
             try:
-                # Keep the two inverter rows and the system row
-                # atomic, but release SQLite's writer lock
-                # immediately after this telemetry sample.
                 with conn:
-                    insert_inverter_samples(
-                        conn,
-                        timestamp,
-                        inverter_readings,
-                    )
-
-                    insert_system_sample(
-                        conn,
-                        timestamp,
-                        system_sample,
-                    )
-
-            except sqlite3.OperationalError as exc:
-                print(
-                    f"Database write failed: {exc}",
-                    flush=True,
-                )
-                time.sleep(SAMPLE_INTERVAL)
+                    insert_inverter_samples(conn, timestamp, inverters)
+                    insert_system_sample(conn, timestamp, system)
+                    for event_type, message, severity, inverter_id in pending_events:
+                        record_event(conn, timestamp, event_type, message, severity, inverter_id)
+                        print(f"EVENT {severity}: {message}", flush=True)
+            except sqlite3.Error as exc:
+                print(f"Database write failed: {exc}", flush=True)
+                _sleep_remaining(cycle_started)
                 continue
 
-            # Publish live state only after the database
-            # transaction committed successfully.
-            write_live_sample(
-                timestamp,
-                system_sample,
-            )
+            live.write(timestamp, system, inverters)
 
             print(
-                f"{timestamp} | "
-                f"PV "
-                f"{system_sample['total_pv_watts']:7.1f} W | "
-                f"Load "
-                f"{system_sample['total_load_watts']:7.1f} W | "
-                f"Battery "
-                f"{system_sample['battery_soc']:5.1f}% "
-                f"{system_sample['battery_voltage']:5.2f} V | "
-                f"Batt Power "
-                f"{system_sample['battery_watts']:7.1f} W"
+                f"{timestamp} | PV {system['total_pv_watts']:7.1f} W | "
+                f"Load {system['total_load_watts']:7.1f} W | "
+                f"Battery {system['battery_soc']:5.1f}% {system['battery_voltage']:5.2f} V | "
+                f"Batt Power {system['battery_watts']:7.1f} W | "
+                f"Modes {'/'.join(system['modes'].values())}",
+                flush=True,
             )
-
-            time.sleep(
-                SAMPLE_INTERVAL
-            )
+            _sleep_remaining(cycle_started)
 
     except KeyboardInterrupt:
-        print(
-            "\nStopping collector..."
-        )
-
+        print("\nStopping collector...")
+    except Exception:
+        traceback.print_exc()
+        raise
     finally:
+        link.close()
         conn.close()
-        print(
-            "Database connection closed."
-        )
+        print("Database connection closed.")
+
+
+def _sleep_remaining(cycle_started):
+    """Keep cycles on a fixed cadence regardless of serial latency."""
+    elapsed = time.monotonic() - cycle_started
+    time.sleep(max(0.5, settings.SAMPLE_INTERVAL - elapsed))
 
 
 if __name__ == "__main__":
