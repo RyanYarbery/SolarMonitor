@@ -10,6 +10,7 @@ import sqlite3
 from collections import defaultdict
 from datetime import date, timedelta
 
+import alerts
 import settings
 from timeutil import (
     floor_minute,
@@ -242,6 +243,23 @@ def _daily_date_range(conn, raw_table, summary_table):
     return start, today_local()
 
 
+def daily_insolation_wh_m2(conn, day_start, day_end):
+    """Sum of hourly GHI rows (W/m² mean over the hour == Wh/m²) for the day.
+
+    Returns None unless the day is essentially fully covered, so a partial
+    weather fetch does not produce a wildly wrong performance ratio.
+    """
+    row = conn.execute(
+        "SELECT COUNT(*), SUM(ghi_wm2) FROM weather_samples "
+        "WHERE timestamp > ? AND timestamp <= ? AND ghi_wm2 IS NOT NULL",
+        (to_iso(day_start), to_iso(day_end)),
+    ).fetchone()
+    hours = (day_end - day_start).total_seconds() / 3600
+    if row is None or row[0] < hours - 1:
+        return None
+    return float(row[1] or 0.0)
+
+
 def aggregate_daily(conn):
     start, today = _daily_date_range(conn, "system_samples", "daily_summary")
     if start is None:
@@ -270,6 +288,12 @@ def aggregate_daily(conn):
         pv_peak = peak(samples, "total_pv_watts")
         load_peak = peak(samples, "total_load_watts")
         soc = [r["battery_soc"] for r in samples]
+
+        insolation = daily_insolation_wh_m2(conn, day_start, day_end)
+        performance_ratio = None
+        if insolation and insolation > 0 and installed_pv_kw > 0:
+            # PR = E_actual[kWh] / (P_nameplate[kWp] * H[kWh/m²])
+            performance_ratio = pv_wh / (installed_pv_kw * insolation)
 
         producing = [
             r
@@ -318,6 +342,8 @@ def aggregate_daily(conn):
                 "capacity_factor": (
                     pv_wh / 1000.0 / (installed_pv_kw * 24) if installed_pv_kw > 0 else None
                 ),
+                "insolation_wh_m2": insolation,
+                "performance_ratio": performance_ratio,
             },
         )
         conn.commit()  # keep the writer transaction short
@@ -371,14 +397,28 @@ def aggregate_daily_inverters(conn):
                     "fault_count": sum(1 for r in samples if r["fault_code"] not in NO_FAULT),
                 },
             )
+            if inverter_id in (1, 2):
+                conn.execute(
+                    f"UPDATE daily_summary SET inverter_{inverter_id}_pv_wh = ? WHERE date = ?",
+                    (integrate_energy(samples, "pv_watts"), day.isoformat()),
+                )
             count += 1
         conn.commit()
         day += timedelta(days=1)
     return count
 
 
-def _aggregate_periods(conn, table, key_col, key_fn, avg_prefix):
-    rows = conn.execute("SELECT * FROM daily_summary ORDER BY date").fetchall()
+def _aggregate_periods(conn, table, key_col, key_fn, avg_prefix, since=None):
+    """Rebuild period rows. With `since` (a local date) only periods containing
+    that date or later are recomputed; a still-empty table is built in full."""
+    if since is not None and conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+        period_start = since.replace(day=1) if key_col == "month" else since.replace(month=1, day=1)
+        rows = conn.execute(
+            "SELECT * FROM daily_summary WHERE date >= ? ORDER BY date",
+            (period_start.isoformat(),),
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM daily_summary ORDER BY date").fetchall()
     groups = defaultdict(list)
     for row in rows:
         groups[key_fn(row["date"])].append(row)
@@ -415,12 +455,14 @@ def _aggregate_periods(conn, table, key_col, key_fn, avg_prefix):
     return count
 
 
-def aggregate_monthly(conn):
-    return _aggregate_periods(conn, "monthly_summary", "month", lambda d: d[:7], "avg")
+def aggregate_monthly(conn, since=None):
+    return _aggregate_periods(conn, "monthly_summary", "month", lambda d: d[:7], "avg", since)
 
 
-def aggregate_yearly(conn):
-    return _aggregate_periods(conn, "yearly_summary", "year", lambda d: int(d[:4]), "average")
+def aggregate_yearly(conn, since=None):
+    return _aggregate_periods(
+        conn, "yearly_summary", "year", lambda d: int(d[:4]), "average", since
+    )
 
 
 # ------------------------------------------------------------------ retention
@@ -527,13 +569,47 @@ def prune_old_data(conn, raw_days=None, minute_days=None):
 # ----------------------------------------------------------------------- main
 
 
+def check_telemetry_age(conn, stale_after=None):
+    """Alert (with cooldown) when the collector has stopped writing.
+
+    The collector cannot report its own death; this runs from the timer.
+    Returns the age in seconds, or None when there is no data at all.
+    """
+    stale_after = settings.STALE_ALERT_AFTER if stale_after is None else stale_after
+    latest = get_latest_timestamp(conn, "system_samples")
+    if latest is None:
+        return None
+    age = (now_utc() - latest).total_seconds()
+    with conn:
+        if age > stale_after:
+            alerts.raise_alert(
+                conn,
+                "telemetry_stale",
+                "Solar telemetry stale",
+                f"Last sample {int(age // 60)} minutes ago. Collector may be down.",
+                "warning",
+                ("warning",),
+            )
+        else:
+            alerts.clear_alert(
+                conn,
+                "telemetry_stale",
+                "Solar telemetry resumed",
+                f"Latest sample is {int(age)} seconds old.",
+            )
+    return age
+
+
 def run(conn):
+    daily_since, _ = _daily_date_range(conn, "system_samples", "daily_summary")
     print(f"Minute buckets updated: {aggregate_minutes(conn)}")
     print(f"15-minute buckets updated: {aggregate_quarter_hours(conn)}")
     print(f"Daily summaries updated: {aggregate_daily(conn)}")
     print(f"Daily inverter summaries updated: {aggregate_daily_inverters(conn)}")
-    print(f"Monthly summaries updated: {aggregate_monthly(conn)}")
-    print(f"Yearly summaries updated: {aggregate_yearly(conn)}")
+    print(f"Monthly summaries updated: {aggregate_monthly(conn, daily_since)}")
+    print(f"Yearly summaries updated: {aggregate_yearly(conn, daily_since)}")
+    age = check_telemetry_age(conn)
+    print(f"Newest sample age: {'n/a' if age is None else f'{int(age)} s'}")
     deleted = prune_old_data(conn)
     print(
         f"Retention pruned: {deleted['system_samples']} system, "
