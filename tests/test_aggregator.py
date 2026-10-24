@@ -256,3 +256,53 @@ class PeriodAndWeatherTests(unittest.TestCase):
                 self.assertIn("resumed", send.call_args[0][0].lower())
         finally:
             conn.close()
+
+
+class RebuildDaysTests(unittest.TestCase):
+    def setUp(self):
+        self.conn, self.path = fresh_db()
+
+    def tearDown(self):
+        self.conn.close()
+        cleanup_db(self.path)
+
+    def test_rebuild_replaces_stale_buckets_and_daily(self):
+        day = today_local() - timedelta(days=2)
+        start, end = local_day_bounds(day)
+        insert_system_rows(self.conn, start, end, step=timedelta(seconds=30), pv=1000.0)
+        self.conn.execute(
+            "INSERT INTO minute_summary(timestamp,pv_watts_avg,sample_count) VALUES(?,999,1)",
+            (to_iso(start + timedelta(hours=1)),),
+        )
+        self.conn.execute(
+            "INSERT INTO daily_summary(date,pv_energy_wh) VALUES(?,1)", (day.isoformat(),)
+        )
+        self.conn.commit()
+        conn = aggregator.connect_db()
+        try:
+            self.assertEqual(aggregator.rebuild_days(conn, [day]), 1)
+            minute = conn.execute(
+                "SELECT pv_watts_avg FROM minute_summary WHERE timestamp=?",
+                (to_iso(start + timedelta(hours=1)),),
+            ).fetchone()[0]
+            self.assertEqual(minute, 1000.0)
+            daily = conn.execute(
+                "SELECT pv_energy_wh FROM daily_summary WHERE date=?", (day.isoformat(),)
+            ).fetchone()[0]
+            hours = (end - start).total_seconds() / 3600
+            self.assertAlmostEqual(daily, 1000 * hours, delta=50)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM monthly_summary").fetchone()[0], 1)
+        finally:
+            conn.close()
+
+    def test_cli_rebuild(self):
+        day = today_local() - timedelta(days=2)
+        start, end = local_day_bounds(day)
+        insert_system_rows(self.conn, start, end)
+        self.conn.commit()
+        aggregator.main(["--rebuild", day.isoformat()])
+        conn = aggregator.connect_db()
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM daily_summary").fetchone()[0], 1)
+        finally:
+            conn.close()

@@ -94,6 +94,12 @@ All timestamps are stored as UTC ISO-8601 text with an explicit offset, for exam
 
 Databases created before schema v3 used naive local time, which produced duplicate keys during the autumn DST change and crashed the collector. `migrate_v3.py` converts them.
 
+If the old collector ran through a fall-back night (for example 1 November 2026), the 01:00 hour was recorded twice with identical local timestamps. systemd restarted the collector after each collision, so some samples are missing, but the data that was written is recoverable: the migration tells the two passes apart by insertion order, places the second pass an hour later in UTC, and rebuilds every roll-up for the affected day from the repaired raw samples. To redo that for any day by hand:
+
+```bash
+python aggregator.py --rebuild 2026-11-01
+```
+
 ## SQLite storage
 
 The primary database is `solar_v1.db`. Important tables:
@@ -243,6 +249,7 @@ journalctl -u solar-collector.service -f
 - **`CRC mismatch on ...` in the collector log.** A frame was corrupted in transit and discarded. Occasional mismatches are normal on a long or noisy serial run. If every frame fails, run `python probe_inverter.py` to inspect raw bytes; if the inverter consistently sends a CRC that does not verify, set `SOLAR_SERIAL_STRICT_CRC=0` and open an issue with the probe output.
 - **Dashboard shows "Telemetry is stale".** The collector is not writing. Check its journal. If `SOLAR_NTFY_URL` is set you will also have received a push notification.
 - **Collector restarts every 90 seconds under systemd.** The watchdog is firing because a cycle took too long. Look for a hung serial read in the journal; the FTDI adapter may need re-plugging. Raise `WatchdogSec` only if cycles are legitimately slow.
+- **A past day's numbers look wrong.** Rebuild it from raw samples with `python aggregator.py --rebuild YYYY-MM-DD` (raw data is kept for `SOLAR_RAW_RETENTION_DAYS`).
 - **Performance ratio stays blank.** Needs `installed_pv_kw`, `latitude`, `longitude`, the weather timer enabled, and a full day of hourly rows.
 - **`Retention aborted: missing ... daily summaries`.** The aggregator refused to delete raw data for a day it has not summarised. Run `python aggregator.py` again; if it persists, the day's raw data is incomplete and the message names it.
 

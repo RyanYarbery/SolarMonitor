@@ -147,14 +147,21 @@ def upsert(conn, table, key_cols, values):
     )
 
 
-def _bucketed(conn, summary_table, overlap, floor_fn):
-    """Yield (bucket_iso, rows) for every complete bucket needing (re)compute."""
-    raw_start = get_raw_start(conn)
-    if raw_start is None:
-        return {}
-    latest = get_latest_timestamp(conn, summary_table)
-    start = raw_start if latest is None else max(raw_start, latest - overlap)
-    end = floor_fn(now_utc())  # never summarise the current, incomplete bucket
+def _bucketed(conn, summary_table, overlap, floor_fn, window=None):
+    """Yield (bucket_iso, rows) for every complete bucket needing (re)compute.
+
+    `window` = (start, end) restricts the work to an explicit UTC range,
+    used when rebuilding history; otherwise the incremental overlap applies.
+    """
+    if window is not None:
+        start, end = window
+    else:
+        raw_start = get_raw_start(conn)
+        if raw_start is None:
+            return {}
+        latest = get_latest_timestamp(conn, summary_table)
+        start = raw_start if latest is None else max(raw_start, latest - overlap)
+        end = floor_fn(now_utc())  # never summarise the current, incomplete bucket
 
     groups = defaultdict(list)
     for row in load_system_rows(conn, start, end):
@@ -166,9 +173,11 @@ def _bucketed(conn, summary_table, overlap, floor_fn):
 # ------------------------------------------------------------------- roll-ups
 
 
-def aggregate_minutes(conn):
+def aggregate_minutes(conn, window=None):
     count = 0
-    for ts, samples in _bucketed(conn, "minute_summary", MINUTE_OVERLAP, floor_minute).items():
+    for ts, samples in _bucketed(
+        conn, "minute_summary", MINUTE_OVERLAP, floor_minute, window
+    ).items():
         pv = [r["total_pv_watts"] for r in samples]
         load = [r["total_load_watts"] for r in samples]
         soc = [r["battery_soc"] for r in samples]
@@ -197,10 +206,10 @@ def aggregate_minutes(conn):
     return count
 
 
-def aggregate_quarter_hours(conn):
+def aggregate_quarter_hours(conn, window=None):
     count = 0
     for ts, samples in _bucketed(
-        conn, "quarter_hour_summary", QUARTER_OVERLAP, floor_quarter_hour
+        conn, "quarter_hour_summary", QUARTER_OVERLAP, floor_quarter_hour, window
     ).items():
         soc = [r["battery_soc"] for r in samples]
         upsert(
@@ -260,10 +269,20 @@ def daily_insolation_wh_m2(conn, day_start, day_end):
     return float(row[1] or 0.0)
 
 
-def aggregate_daily(conn):
-    start, today = _daily_date_range(conn, "system_samples", "daily_summary")
-    if start is None:
-        return 0
+def _days_between(start, end):
+    day = start
+    while day < end:
+        yield day
+        day += timedelta(days=1)
+
+
+def aggregate_daily(conn, days=None):
+    """Summarise completed local days. `days` overrides the incremental range."""
+    if days is None:
+        start, today = _daily_date_range(conn, "system_samples", "daily_summary")
+        if start is None:
+            return 0
+        days = _days_between(start, today)
 
     config = load_config(conn)
     production_threshold = float(config.get("production_threshold_watts", 100))
@@ -271,11 +290,9 @@ def aggregate_daily(conn):
     battery_capacity_kwh = float(config.get("battery_capacity_kwh", 0))
 
     count = 0
-    day = start
-    while day < today:  # only completed days
+    for day in days:
         day_start, day_end = local_day_bounds(day)
         samples = load_system_rows(conn, day_start, day_end)
-        day += timedelta(days=1)
         if not samples:
             continue
 
@@ -313,7 +330,7 @@ def aggregate_daily(conn):
             "daily_summary",
             ["date"],
             {
-                "date": (day - timedelta(days=1)).isoformat(),
+                "date": day.isoformat(),
                 "pv_energy_wh": pv_wh,
                 "load_energy_wh": load_wh,
                 "battery_charge_wh": charge_wh,
@@ -351,14 +368,15 @@ def aggregate_daily(conn):
     return count
 
 
-def aggregate_daily_inverters(conn):
-    start, today = _daily_date_range(conn, "inverter_samples", "daily_inverter_summary")
-    if start is None:
-        return 0
+def aggregate_daily_inverters(conn, days=None):
+    if days is None:
+        start, today = _daily_date_range(conn, "inverter_samples", "daily_inverter_summary")
+        if start is None:
+            return 0
+        days = _days_between(start, today)
 
     count = 0
-    day = start
-    while day < today:
+    for day in days:
         day_start, day_end = local_day_bounds(day)
         rows = conn.execute(
             """
@@ -404,8 +422,33 @@ def aggregate_daily_inverters(conn):
                 )
             count += 1
         conn.commit()
-        day += timedelta(days=1)
     return count
+
+
+def rebuild_days(conn, days):
+    """Recompute every roll-up for the given local dates from raw samples.
+
+    Used after the v3 migration repairs the DST fall-back hour, or whenever
+    raw data for a past day has been corrected. Minute and quarter buckets
+    inside each day are deleted first so stale buckets cannot survive.
+    """
+    days = sorted(set(days))
+    for day in days:
+        start, end = local_day_bounds(day)
+        with conn:
+            for table in ("minute_summary", "quarter_hour_summary"):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE timestamp >= ? AND timestamp < ?",
+                    (to_iso(start), to_iso(end)),
+                )
+        aggregate_minutes(conn, window=(start, end))
+        aggregate_quarter_hours(conn, window=(start, end))
+    aggregate_daily(conn, days=days)
+    aggregate_daily_inverters(conn, days=days)
+    if days:
+        aggregate_monthly(conn, since=days[0])
+        aggregate_yearly(conn, since=days[0])
+    return len(days)
 
 
 def _aggregate_periods(conn, table, key_col, key_fn, avg_prefix, since=None):
@@ -617,12 +660,21 @@ def run(conn):
     )
 
 
-def main():
+def main(argv=None):
+    import sys
+
+    argv = sys.argv[1:] if argv is None else argv
     if not settings.DB_PATH.exists():
         raise FileNotFoundError(f"{settings.DB_PATH} does not exist")
-    print("Running incremental solar aggregation...")
     conn = connect_db()
     try:
+        if argv and argv[0] == "--rebuild":
+            days = [date.fromisoformat(d) for d in argv[1:]]
+            if not days:
+                raise SystemExit("usage: aggregator.py --rebuild YYYY-MM-DD [YYYY-MM-DD ...]")
+            print(f"Rebuilt {rebuild_days(conn, days)} day(s) from raw samples.")
+            return
+        print("Running incremental solar aggregation...")
         run(conn)
     finally:
         conn.close()
