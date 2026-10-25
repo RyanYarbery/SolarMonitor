@@ -10,12 +10,14 @@ from flask import Flask, Response, jsonify, render_template_string, request
 
 import settings
 from aggregator import integrate_energy
+from collector import NO_FAULT
 from eg4 import MODES
 from timeutil import local_day_bounds, now_utc, parse_iso, to_iso, today_local
 
 app = Flask(__name__)
 
 MAX_HISTORY_HOURS = 24 * 365 * 3
+MAX_BARS = 130
 
 
 def connect_db():
@@ -48,11 +50,21 @@ def get_latest_reading():
                 FROM system_samples ORDER BY id DESC LIMIT 1
                 """
             ).fetchone()
+            inverters = _latest_inverter_rows(conn) if row is not None else []
         finally:
             conn.close()
         if row is None:
             return None
         reading = dict(row)
+        # The live snapshot carries these; derive them so the AC-input tile and
+        # fault banner still work when the snapshot is missing (first start,
+        # or the dashboard running on another host against a copied database).
+        volts = [i["grid_voltage"] for i in inverters if i["grid_voltage"] is not None]
+        reading["grid_voltage"] = max(volts) if volts else None
+        reading["grid_present"] = (
+            None if not volts else reading["grid_voltage"] >= settings.GRID_ON_VOLTS
+        )
+        reading["any_fault"] = any((i["fault_code"] or "") not in NO_FAULT for i in inverters)
 
     try:
         age = (now_utc() - parse_iso(reading["timestamp"])).total_seconds()
@@ -63,25 +75,29 @@ def get_latest_reading():
     return reading
 
 
+def _latest_inverter_rows(conn):
+    return conn.execute(
+        """
+        SELECT s.timestamp, s.inverter_id, s.grid_voltage, s.output_voltage,
+               s.output_frequency, s.output_watts, s.output_va, s.load_percent,
+               s.battery_voltage, s.battery_soc, s.pv_voltage, s.pv_current, s.pv_watts,
+               s.pv1_voltage, s.pv1_current, s.pv1_watts,
+               s.pv2_voltage, s.pv2_current, s.pv2_watts,
+               s.inverter_temperature_c, s.mode, s.fault_code, s.status
+        FROM inverter_samples AS s
+        INNER JOIN (
+            SELECT inverter_id, MAX(id) AS max_id
+            FROM inverter_samples GROUP BY inverter_id
+        ) AS latest ON s.id = latest.max_id
+        ORDER BY s.inverter_id
+        """
+    ).fetchall()
+
+
 def get_latest_inverters():
     conn = connect_db()
     try:
-        rows = conn.execute(
-            """
-            SELECT s.timestamp, s.inverter_id, s.output_voltage, s.output_frequency,
-                   s.output_watts, s.output_va, s.load_percent, s.battery_voltage,
-                   s.battery_soc, s.pv_voltage, s.pv_current, s.pv_watts,
-                   s.pv1_voltage, s.pv1_current, s.pv1_watts,
-                   s.pv2_voltage, s.pv2_current, s.pv2_watts,
-                   s.inverter_temperature_c, s.mode, s.fault_code, s.status
-            FROM inverter_samples AS s
-            INNER JOIN (
-                SELECT inverter_id, MAX(id) AS max_id
-                FROM inverter_samples GROUP BY inverter_id
-            ) AS latest ON s.id = latest.max_id
-            ORDER BY s.inverter_id
-            """
-        ).fetchall()
+        rows = _latest_inverter_rows(conn)
     finally:
         conn.close()
 
@@ -107,7 +123,7 @@ def get_recent_events(limit=50):
         rows = conn.execute(
             """
             SELECT id, timestamp, event_type, severity, source, inverter_id, message, cleared_at
-            FROM events ORDER BY id DESC LIMIT ?
+            FROM events ORDER BY timestamp DESC, id DESC LIMIT ?
             """,
             (limit,),
         ).fetchall()
@@ -165,21 +181,36 @@ def get_summary():
         config = dict(conn.execute("SELECT key, value FROM system_config").fetchall())
         yesterday = conn.execute(
             "SELECT pv_energy_wh, load_energy_wh, battery_soc_min, pv_peak_watts, "
-            "insolation_wh_m2, performance_ratio FROM daily_summary WHERE date = ?",
+            "pv_peak_time, insolation_wh_m2, performance_ratio "
+            "FROM daily_summary WHERE date = ?",
             ((today_local() - timedelta(days=1)).isoformat(),),
         ).fetchone()
         today = energy_today(conn)
-        soc_min_today = conn.execute(
-            "SELECT MIN(battery_soc) FROM system_samples WHERE timestamp >= ?",
-            (to_iso(local_day_bounds(today_local())[0]),),
-        ).fetchone()[0]
+        day_start = to_iso(local_day_bounds(today_local())[0])
+        soc_min_today, pv_peak_today = conn.execute(
+            "SELECT MIN(battery_soc), MAX(total_pv_watts) FROM system_samples WHERE timestamp >= ?",
+            (day_start,),
+        ).fetchone()
+        pv_peak_time = None
+        if pv_peak_today:
+            pv_peak_time = conn.execute(
+                "SELECT timestamp FROM system_samples WHERE timestamp >= ? "
+                "AND total_pv_watts = ? ORDER BY timestamp LIMIT 1",
+                (day_start, pv_peak_today),
+            ).fetchone()[0]
     finally:
         conn.close()
 
     reading = get_latest_reading()
     capacity = float(config.get("battery_capacity_kwh") or 0)
     return {
-        "today": dict(today, battery_soc_min=soc_min_today),
+        "today": dict(
+            today,
+            battery_soc_min=soc_min_today,
+            pv_peak_watts=pv_peak_today,
+            pv_peak_time=pv_peak_time,
+        ),
+        "has_coordinates": bool(config.get("latitude") and config.get("longitude")),
         "yesterday": dict(yesterday) if yesterday else None,
         "battery": battery_runtime(reading, capacity),
         "battery_capacity_kwh": capacity or None,
@@ -306,7 +337,9 @@ def get_recent_readings(hours=24, max_points=720):
                 SELECT MIN(timestamp) AS timestamp,
                        AVG(pv_energy_wh * 4.0) AS pv_value,
                        AVG(load_energy_wh * 4.0) AS load_value,
-                       AVG((battery_soc_min + battery_soc_max) / 2.0) AS battery_soc
+                       AVG((battery_soc_min + battery_soc_max) / 2.0) AS battery_soc,
+                       MIN(battery_soc_min) AS battery_soc_min,
+                       MAX(battery_soc_max) AS battery_soc_max
                 FROM quarter_hour_summary
                 WHERE timestamp >= ?
                 {_bucket_group(bucket_seconds)}
@@ -316,17 +349,28 @@ def get_recent_readings(hours=24, max_points=720):
             ).fetchall()
             return _history("quarter_hour", rows, max(2700, bucket_seconds * 3))
 
+        # Energy per day draws as bars, which stop being readable beyond
+        # about 130 of them; fold longer ranges into calendar weeks or months.
         days = max(1, int(round(hours / 24)))
-        bucket_days = max(1, -(-days // max_points))
+        if days <= MAX_BARS:
+            bucket, group, gap_days = "day", "date", 1
+        elif days <= MAX_BARS * 7:
+            # julianday(...) + 1 makes integer division land on Mondays.
+            bucket, group, gap_days = "week", "(CAST(julianday(date) AS INTEGER) + 1) / 7", 7
+        else:
+            bucket, group, gap_days = "month", "strftime('%Y-%m', date)", 31
         rows = conn.execute(
             f"""
             SELECT MIN(date) || 'T12:00:00' AS timestamp,
                    AVG(pv_energy_wh) / 1000.0 AS pv_value,
                    AVG(load_energy_wh) / 1000.0 AS load_value,
-                   AVG((battery_soc_min + battery_soc_max) / 2.0) AS battery_soc
+                   AVG((battery_soc_min + battery_soc_max) / 2.0) AS battery_soc,
+                   MIN(battery_soc_min) AS battery_soc_min,
+                   MAX(battery_soc_max) AS battery_soc_max,
+                   COUNT(*) AS days
             FROM daily_summary
             WHERE date >= ?
-            GROUP BY CAST(julianday(date) AS INTEGER) / {bucket_days}
+            GROUP BY {group}
             ORDER BY MIN(date)
             """,
             ((today_local() - timedelta(days=days)).isoformat(),),
@@ -334,9 +378,10 @@ def get_recent_readings(hours=24, max_points=720):
         return {
             "mode": "daily_energy",
             "source": "daily",
+            "bucket": bucket,
             "pv_unit": "kWh/day",
             "load_unit": "kWh/day",
-            "points": add_gap_markers(rows, bucket_days * 86400),
+            "points": add_gap_markers(rows, gap_days * 86400),
         }
     finally:
         conn.close()
@@ -549,7 +594,10 @@ __BASE_CSS__
   .events-wrap { padding: 4px 8px; }
   @media (max-width: 600px) {
     body { padding: 0 12px 24px; }
-    .tile .value { font-size: 26px; }
+    .tiles, .tiles.secondary { grid-template-columns: 1fr 1fr; gap: 10px; }
+    .tile { padding: 12px 12px 10px; }
+    .tile .value { font-size: 24px; } .tiles.secondary .value { font-size: 20px; }
+    .tile .sub { font-size: 12px; }
     table.events td.type { display: none; }
   }
 </style>
@@ -580,14 +628,14 @@ __BASE_CSS__
 </div>
 
 <div class="tiles secondary" style="margin-top:12px">
-  <div class="tile"><div class="label">Battery power</div><div class="value num" id="batteryWatts">--</div>
-    <div class="sub" id="batteryWattsLabel"></div></div>
+  <div class="tile"><div class="label">Peak solar today</div><div class="value num" id="pvPeak">--</div>
+    <div class="sub num" id="pvPeakLabel">yesterday --</div></div>
   <div class="tile"><div class="label">Battery runtime</div><div class="value num" id="runtime">--</div>
     <div class="sub" id="runtimeLabel">set battery_capacity_kwh to enable</div></div>
   <div class="tile"><div class="label">Lowest SOC today</div><div class="value num" id="socMinToday">--</div>
     <div class="sub num" id="socMinYesterday">yesterday --</div></div>
   <div class="tile"><div class="label">Yesterday's performance</div><div class="value num" id="prYesterday">--</div>
-    <div class="sub" id="prLabel">needs latitude/longitude and installed_pv_kw</div></div>
+    <div class="sub" id="prLabel"></div></div>
 </div>
 
 <h2>Inverters</h2>
@@ -608,11 +656,12 @@ __BASE_CSS__
 <div class="card chart-card">
   <div class="chart-head"><div class="chart-title" id="powerTitle">Power</div>
     <div class="legend"><span style="--c:var(--solar)" id="pvLegend">Solar</span><span style="--c:var(--load)" id="loadLegend">Load</span></div></div>
-  <canvas id="powerChart"></canvas><div class="tip" id="powerTip"></div>
+  <canvas id="powerChart" role="img" aria-label="Solar production and house load over time"></canvas><div class="tip" id="powerTip"></div>
 </div>
 <div class="card chart-card">
-  <div class="chart-head"><div class="chart-title">Battery state of charge</div></div>
-  <canvas id="socChart"></canvas><div class="tip" id="socTip"></div>
+  <div class="chart-head"><div class="chart-title">Battery state of charge</div>
+    <div class="legend" id="socLegend"></div></div>
+  <canvas id="socChart" role="img" aria-label="Battery state of charge over time"></canvas><div class="tip" id="socTip"></div>
 </div>
 
 <h2>Recent events</h2>
@@ -640,6 +689,7 @@ function whenText(iso) {
   if (sameDay(d, yest)) return "Yesterday " + t;
   return d.toLocaleDateString([], {month: "short", day: "numeric"}) + ", " + t;
 }
+const timeText = iso => { const d = new Date(iso); return Number.isFinite(d.getTime()) ? d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"}) : ""; };
 const setDot = cls => { $("statusDot").className = "dot " + cls; };
 
 let latest = {};
@@ -659,8 +709,6 @@ async function updateDashboard() {
     const bw = Number(d.battery_watts);
     const flow = !isNum(d.battery_watts) ? "" : Math.abs(bw) < 25 ? "idle" : bw > 0 ? "charging at " + watts(bw) : "discharging at " + watts(-bw);
     $("batterySub").textContent = [fmt(d.battery_voltage, 1, " V"), flow].filter(Boolean).join(" · ");
-    $("batteryWatts").textContent = isNum(d.battery_watts) ? (bw > 0 ? "+" : bw < 0 ? "−" : "") + watts(Math.abs(bw)) : "--";
-    $("batteryWattsLabel").textContent = !isNum(d.battery_watts) ? "" : Math.abs(bw) < 25 ? "idle" : bw > 0 ? "charging" : "discharging";
     if (d.grid_present === true) {
       $("grid").textContent = "On";
       $("gridLabel").textContent = fmt(d.grid_voltage, 0, " V") + " at the input";
@@ -694,7 +742,7 @@ function inverterCard(inv) {
   const row = (k, v, small) => `<div class="row"><span class="k">${k}</span><span class="v num${v === "fault" ? " fault" : ""}">${v}${small ? `<small>${small}</small>` : ""}</span></div>`;
   return `<div class="card inv">
     <div class="inv-head"><h3>Inverter ${esc(inv.inverter_id)}</h3>
-      <span class="chip">${esc(inv.mode_name || "--")} · ${esc(inv.mode || "?")}</span>
+      <span class="chip" title="mode ${esc(inv.mode || "?")}">${esc((inv.mode_name || "--").replace(/_/g, " "))}</span>
       ${faulted ? `<span class="chip fault">Fault ${esc(inv.fault_code)}</span>` : `<span class="chip ok">no fault</span>`}
       <span class="chip">PV ${esc(inv.pv_quality)}</span></div>
     <div class="kv">
@@ -728,9 +776,20 @@ async function updateSummary() {
     $("loadSub").textContent = "today " + kwh(s.today.load_wh) + " · yesterday " + (y ? kwh(y.load_energy_wh) : "--");
     $("socMinToday").textContent = fmt(s.today.battery_soc_min, 0, "%");
     $("socMinYesterday").textContent = "yesterday " + (y ? fmt(y.battery_soc_min, 0, "%") : "--");
+    const pk = s.today.pv_peak_watts;
+    $("pvPeak").textContent = isNum(pk) && pk > 0 ? watts(pk) : "--";
+    $("pvPeakLabel").textContent = [
+      isNum(pk) && pk > 0 && s.today.pv_peak_time ? "at " + timeText(s.today.pv_peak_time) : null,
+      "yesterday " + (y && isNum(y.pv_peak_watts) ? watts(y.pv_peak_watts) : "--"),
+    ].filter(Boolean).join(" · ");
     if (y && isNum(y.performance_ratio)) {
       $("prYesterday").textContent = (y.performance_ratio * 100).toFixed(0) + "%";
       $("prLabel").textContent = "of nameplate × " + (y.insolation_wh_m2 / 1000).toFixed(2) + " kWh/m² insolation";
+    } else {
+      $("prYesterday").textContent = "--";
+      $("prLabel").textContent = !s.installed_pv_kw ? "set installed_pv_kw to enable"
+        : !s.has_coordinates ? "set latitude and longitude to enable"
+        : !y ? "no summary for yesterday yet" : "no insolation data for yesterday";
     }
     const b = s.battery;
     if (b) {
@@ -764,7 +823,7 @@ function niceStep(range, target) {
   return 10 * mag;
 }
 function axisFmt(v, unit, step) {
-  if (unit === "W") return Math.abs(v) >= 1000 ? (v / 1000).toFixed(v % 1000 === 0 ? 0 : 1) + " kW" : Math.round(v) + " W";
+  if (unit === "W") return (step || 0) >= 1000 || Math.abs(v) >= 1000 ? (v / 1000).toFixed(v % 1000 === 0 ? 0 : 1) + " kW" : Math.round(v) + " W";
   if (unit === "%") return Math.round(v) + "%";
   return v.toFixed((step || 1) >= 1 ? 0 : 1) + " " + unit;
 }
@@ -809,10 +868,11 @@ class Chart {
     this.canvas.addEventListener("pointerleave", () => { this.hover = null; this.tip.style.display = "none"; this.draw(); });
     new ResizeObserver(() => this.draw()).observe(this.canvas);
   }
-  setData(points, series, unit, mode) {
+  setData(points, series, unit, mode, bucket) {
     this.points = points.filter(p => Number.isFinite(new Date(p.timestamp).getTime()));
     this.times = this.points.map(p => new Date(p.timestamp).getTime());
-    this.series = series; this.unit = unit; this.mode = mode; this.hover = null;
+    this.series = series; this.unit = unit; this.mode = mode; this.bucket = bucket; this.hover = null;
+    this.tip.style.display = "none";
     this.draw();
   }
   layout() {
@@ -831,19 +891,27 @@ class Chart {
     ctx.font = "12px system-ui, sans-serif";
     const pts = this.points || [], series = this.series || [];
     const values = [];
-    for (const s of series) for (const p of pts) if (isNum(p[s.key])) values.push(Number(p[s.key]));
+    for (const s of series) for (const p of pts) for (const k of [s.key, ...(s.band || [])]) if (isNum(p[k])) values.push(Number(p[k]));
     if (!values.length) {
       ctx.fillStyle = css("--muted"); ctx.fillText("No historical data for this range.", 12, 24); return;
     }
     let lo = this.opts.yMin === "auto" ? Math.min(...values) : 0, hi = Math.max(...values);
     if (this.opts.yMax !== undefined) hi = Math.max(hi, this.opts.yMax);
+    if (this.opts.yCap !== undefined) hi = Math.min(hi, this.opts.yCap);
     const step = niceStep(hi - lo || 1, 4);
     lo = Math.floor(lo / step) * step; hi = Math.ceil(hi / step) * step; if (hi === lo) hi = lo + step;
     const yTicks = []; for (let v = lo; v <= hi + 1e-9; v += step) yTicks.push(v);
     const labels = yTicks.map(v => axisFmt(v, this.unit, step));
     const left = Math.ceil(Math.max(...labels.map(l => ctx.measureText(l).width))) + 12, right = 10, top = 10, bottom = 26;
     const pw = w - left - right, ph = h - top - bottom;
-    const minT = Math.min(...this.times), maxT = Math.max(...this.times), span = Math.max(maxT - minT, 1);
+    const bars = this.mode === "bars" && pts.length <= 130;
+    let minT = Math.min(...this.times), maxT = Math.max(...this.times);
+    if (bars) {
+      // Centre each bar on its bucket and keep the end bars inside the plot.
+      const pad = (pts.length > 1 ? (maxT - minT) / (pts.length - 1) : DAY) / 2;
+      minT -= pad; maxT += pad;
+    }
+    const span = Math.max(maxT - minT, 1);
     const X = t => left + (t - minT) / span * pw, Y = v => top + ph - (v - lo) / (hi - lo) * ph;
 
     ctx.strokeStyle = css("--line-2"); ctx.lineWidth = 1; ctx.fillStyle = css("--muted"); ctx.textBaseline = "middle";
@@ -859,7 +927,6 @@ class Chart {
       ctx.fillText(tk.label, x, h - 8);
     }
 
-    const bars = this.mode === "bars" && pts.length <= 130;
     const slot = pw / Math.max(1, pts.length);
     for (const s of series) {
       const color = css(s.color);
@@ -873,6 +940,25 @@ class Chart {
           ctx.lineTo(x + bw - r, y); ctx.arcTo(x + bw, y, x + bw, y + r, r); ctx.lineTo(x + bw, b); ctx.fill();
         }
         continue;
+      }
+      if (s.band) {
+        // Shaded min–max envelope, split at gaps.
+        ctx.fillStyle = color; ctx.globalAlpha = 0.16; let seg = [];
+        const flush = () => {
+          if (seg.length > 1) {
+            ctx.beginPath(); seg.forEach((q, j) => j ? ctx.lineTo(q.x, q.hi) : ctx.moveTo(q.x, q.hi));
+            for (let j = seg.length - 1; j >= 0; j--) ctx.lineTo(seg[j].x, seg[j].lo);
+            ctx.closePath(); ctx.fill();
+          }
+          seg = [];
+        };
+        for (let i = 0; i < pts.length; i++) {
+          const a = pts[i][s.band[0]], b = pts[i][s.band[1]];
+          if (!isNum(a) || !isNum(b)) { flush(); continue; }
+          if (pts[i].gap_before) flush();
+          seg.push({x: X(this.times[i]), lo: Y(Number(a)), hi: Y(Number(b))});
+        }
+        flush(); ctx.globalAlpha = 1;
       }
       if (s.fill) {
         ctx.fillStyle = color; ctx.globalAlpha = 0.12; ctx.beginPath(); let open = false, startX = 0;
@@ -917,15 +1003,24 @@ class Chart {
     const p = this.points[best], d = new Date(this.times[best]);
     const tip = this.tip; tip.textContent = "";
     const head = document.createElement("div"); head.className = "t";
-    head.textContent = this.mode === "bars" ? d.toLocaleDateString([], {weekday: "short", month: "short", day: "numeric", year: "numeric"})
-                                            : d.toLocaleString([], {month: "short", day: "numeric", hour: "numeric", minute: "2-digit"});
+    head.textContent = !this.bucket ? d.toLocaleString([], {month: "short", day: "numeric", hour: "numeric", minute: "2-digit"})
+      : this.bucket === "month" ? d.toLocaleDateString([], {month: "long", year: "numeric"})
+      : (this.bucket === "week" ? "Week of " : "") + d.toLocaleDateString([], {weekday: this.bucket === "week" ? undefined : "short", month: "short", day: "numeric", year: "numeric"});
     tip.appendChild(head);
     for (const s of this.series) {
       const row = document.createElement("div"); row.className = "r";
       const sw = document.createElement("i"); sw.style.background = css(s.color);
-      const b = document.createElement("b"); b.textContent = isNum(p[s.key]) ? (this.unit === "W" ? watts(Number(p[s.key])) : axisFmt(Number(p[s.key]), this.unit)) : "--";
+      const val = v => !isNum(v) ? "--" : this.unit === "W" ? watts(Number(v)) : this.unit === "kWh" ? Number(v).toFixed(1) + " kWh" : axisFmt(Number(v), this.unit);
+      const b = document.createElement("b"); b.textContent = val(p[s.key]);
       const l = document.createElement("span"); l.textContent = s.label;
       row.append(sw, b, l); tip.appendChild(row);
+      if (s.band && isNum(p[s.band[1]])) {
+        const r2 = document.createElement("div"); r2.className = "r";
+        const sw2 = document.createElement("i"); sw2.style.background = css(s.color); sw2.style.opacity = 0.4;
+        const b2 = document.createElement("b"); b2.textContent = val(p[s.band[1]]);
+        const l2 = document.createElement("span"); l2.textContent = s.bandLabel || "highest";
+        r2.append(sw2, b2, l2); tip.appendChild(r2);
+      }
     }
     tip.style.display = "block";
     const cx = e.clientX - rect.left, cardRect = this.canvas.parentElement.getBoundingClientRect();
@@ -936,7 +1031,7 @@ class Chart {
 }
 
 const powerChart = new Chart("powerChart", "powerTip", {yMin: 0});
-const socChart = new Chart("socChart", "socTip", {yMin: "auto", yMax: 100});
+const socChart = new Chart("socChart", "socTip", {yMin: "auto", yMax: 100, yCap: 100});
 
 async function updateHistoryCharts() {
   try {
@@ -944,15 +1039,22 @@ async function updateHistoryCharts() {
     if (!r.ok) throw new Error("HTTP " + r.status);
     const payload = await r.json();
     const points = payload.points || [];
-    const energy = payload.mode === "daily_energy";
-    $("powerTitle").textContent = energy ? "Energy per day" : "Power";
+    const energy = payload.mode === "daily_energy", bucket = payload.bucket || "day";
+    $("powerTitle").textContent = !energy ? "Power" : bucket === "day" ? "Energy per day"
+      : "Energy per day, " + (bucket === "week" ? "weekly" : "monthly") + " average";
     $("pvLegend").textContent = energy ? "Solar kWh" : "Solar";
     $("loadLegend").textContent = energy ? "Load kWh" : "Load";
     powerChart.setData(points, [
       {key: "pv_value", color: "--solar", label: "solar", fill: true, bars: true},
       {key: "load_value", color: "--load", label: "load"},
-    ], energy ? "kWh" : "W", energy ? "bars" : "line");
-    socChart.setData(points, [{key: "battery_soc", color: "--soc", label: "SOC", fill: true}], "%", "line");
+    ], energy ? "kWh" : "W", energy ? "bars" : "line", energy ? bucket : undefined);
+    // Daily buckets carry a min/max: show the lowest SOC with each day's swing
+    // shaded, which is what matters on an off-grid system.
+    const ranged = energy && points.some(p => isNum(p.battery_soc_min) && isNum(p.battery_soc_max));
+    $("socLegend").textContent = ranged ? "line: lowest · shaded: range" : "";
+    socChart.setData(points, ranged
+      ? [{key: "battery_soc_min", color: "--soc", label: "lowest", band: ["battery_soc_min", "battery_soc_max"]}]
+      : [{key: "battery_soc", color: "--soc", label: "SOC", fill: true}], "%", "line", energy ? bucket : undefined);
   } catch (e) { console.error("Error loading history:", e); }
 }
 
@@ -1030,7 +1132,7 @@ __BASE_CSS__
 <div class="wrap"><table>
 <thead>
 <tr><th class="group"></th><th class="group" colspan="4">Energy, kWh</th><th class="group" colspan="2">Battery, kWh</th>
-    <th class="group" colspan="2">Production</th><th class="group" colspan="2">SOC</th><th class="group" colspan="2">Battery</th><th class="group" colspan="3">Performance</th></tr>
+    <th class="group" colspan="2">Production</th><th class="group" colspan="2">SOC</th><th class="group" colspan="2">Battery use</th><th class="group" colspan="3">Performance</th></tr>
 <tr>
   <th>Date</th><th>Solar</th><th>Load</th><th>Inv 1</th><th>Inv 2</th>
   <th>Charge</th><th>Discharge</th><th>Peak W</th><th>Hours</th>
@@ -1065,7 +1167,8 @@ async function load() {
     tile("Solar total", k(pv.reduce((a, b) => a + b, 0)) + " kWh", "avg " + k(avg(pv)) + " kWh/day"),
     tile("Load total", k(ld.reduce((a, b) => a + b, 0)) + " kWh", "avg " + k(avg(ld)) + " kWh/day"),
     tile("Best day", best ? k(best.pv_energy_wh) + " kWh" : "--", best ? best.date : ""),
-    tile("Lowest SOC", socs.length ? Math.min(...socs).toFixed(0) + "%" : "--", "across the range"),
+    tile("Lowest SOC", socs.length ? Math.min(...socs).toFixed(0) + "%" : "--",
+         socs.length ? rows.find(x => x.battery_soc_min === Math.min(...socs)).date : "across the range"),
     tile("Avg performance ratio", prs.length ? pct(avg(prs)) : "--", prs.length ? prs.length + " days with insolation" : "needs weather data"),
   ].join("") : "";
   document.getElementById("rows").innerHTML = rows.length ? rows.map(x => `<tr>
