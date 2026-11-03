@@ -161,18 +161,82 @@ def energy_today(conn):
     return {"pv_wh": round(pv_wh), "load_wh": round(load_wh)}
 
 
-def battery_runtime(reading, capacity_kwh):
-    """Hours to empty (discharging) or to full (charging) at the current rate."""
-    if not reading or not capacity_kwh or capacity_kwh <= 0:
+# Battery time-to-full / time-to-empty. The SOC trend needs no configuration
+# and follows the real charge curve (absorption taper); the capacity-based
+# estimate is the fallback until the SOC has moved enough to fit a slope.
+IDLE_WATTS = 25
+TREND_WINDOW_MINUTES = 20
+TREND_MIN_SPAN_SECONDS = 600
+TREND_MIN_SOC_CHANGE = 1.0
+
+
+def soc_trend(conn, minutes=TREND_WINDOW_MINUTES):
+    """Least-squares SOC slope in %/hour over the recent raw samples, or None."""
+    since = to_iso(now_utc() - timedelta(minutes=minutes))
+    rows = conn.execute(
+        "SELECT timestamp, battery_soc FROM system_samples "
+        "WHERE timestamp >= ? AND battery_soc IS NOT NULL ORDER BY timestamp",
+        (since,),
+    ).fetchall()
+    if len(rows) < 2:
+        return None
+    t0 = parse_iso(rows[0][0])
+    xs = [(parse_iso(r[0]) - t0).total_seconds() / 3600.0 for r in rows]
+    ys = [float(r[1]) for r in rows]
+    span = xs[-1] * 3600.0
+    if span < TREND_MIN_SPAN_SECONDS:
+        return None
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx == 0:
+        return None
+    slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+    return {
+        "slope_pct_per_hour": slope,
+        "soc_change": max(ys) - min(ys),
+        "span_seconds": span,
+    }
+
+
+def battery_runtime(reading, capacity_kwh, trend=None):
+    """Time to full (charging) or to empty (discharging).
+
+    Returns state, hours, an ISO ``eta`` and which method produced it:
+    ``trend`` (fitted SOC slope) or ``capacity`` (nameplate kWh at the
+    current battery power). ``hours`` is None while neither is available.
+    """
+    if not reading:
         return None
     soc = reading.get("battery_soc")
     watts = reading.get("battery_watts")
-    if soc is None or watts is None or abs(watts) < 25:
-        return {"state": "idle", "hours": None}
-    capacity_wh = capacity_kwh * 1000.0
-    if watts < 0:
-        return {"state": "discharging", "hours": round(soc / 100.0 * capacity_wh / -watts, 1)}
-    return {"state": "charging", "hours": round((100.0 - soc) / 100.0 * capacity_wh / watts, 1)}
+    if soc is None or watts is None:
+        return None
+    if abs(watts) < IDLE_WATTS:
+        return {"state": "idle", "hours": None, "eta": None, "method": None, "soc_rate": None}
+    charging = watts > 0
+    state = "charging" if charging else "discharging"
+    remaining_pct = (100.0 - soc) if charging else soc
+    hours = method = rate = None
+    if trend and trend["soc_change"] >= TREND_MIN_SOC_CHANGE:
+        slope = trend["slope_pct_per_hour"]
+        if (slope > 0) == charging and abs(slope) >= 0.1:
+            hours = remaining_pct / abs(slope)
+            method = "trend"
+            rate = round(slope, 1)
+    if hours is None and capacity_kwh and capacity_kwh > 0:
+        hours = remaining_pct / 100.0 * capacity_kwh * 1000.0 / abs(watts)
+        method = "capacity"
+    if hours is None:
+        return {"state": state, "hours": None, "eta": None, "method": None, "soc_rate": None}
+    hours = round(hours, 2)
+    return {
+        "state": state,
+        "hours": hours,
+        "eta": to_iso(now_utc() + timedelta(hours=hours)),
+        "method": method,
+        "soc_rate": rate,
+    }
 
 
 def get_summary():
@@ -198,6 +262,7 @@ def get_summary():
                 "AND total_pv_watts = ? ORDER BY timestamp LIMIT 1",
                 (day_start, pv_peak_today),
             ).fetchone()[0]
+        trend = soc_trend(conn)
     finally:
         conn.close()
 
@@ -212,7 +277,7 @@ def get_summary():
         ),
         "has_coordinates": bool(config.get("latitude") and config.get("longitude")),
         "yesterday": dict(yesterday) if yesterday else None,
-        "battery": battery_runtime(reading, capacity),
+        "battery": battery_runtime(reading, capacity, trend),
         "battery_capacity_kwh": capacity or None,
         "installed_pv_kw": float(config.get("installed_pv_kw") or 0) or None,
     }
@@ -630,8 +695,8 @@ __BASE_CSS__
 <div class="tiles secondary" style="margin-top:12px">
   <div class="tile"><div class="label">Peak solar today</div><div class="value num" id="pvPeak">--</div>
     <div class="sub num" id="pvPeakLabel">yesterday --</div></div>
-  <div class="tile"><div class="label">Battery runtime</div><div class="value num" id="runtime">--</div>
-    <div class="sub" id="runtimeLabel">set battery_capacity_kwh to enable</div></div>
+  <div class="tile"><div class="label" id="runtimeTitle">Battery runtime</div><div class="value num" id="runtime">--</div>
+    <div class="sub" id="runtimeLabel">--</div></div>
   <div class="tile"><div class="label">Lowest SOC today</div><div class="value num" id="socMinToday">--</div>
     <div class="sub num" id="socMinYesterday">yesterday --</div></div>
   <div class="tile"><div class="label">Yesterday's performance</div><div class="value num" id="prYesterday">--</div>
@@ -690,6 +755,19 @@ function whenText(iso) {
   return d.toLocaleDateString([], {month: "short", day: "numeric"}) + ", " + t;
 }
 const timeText = iso => { const d = new Date(iso); return Number.isFinite(d.getTime()) ? d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"}) : ""; };
+function durationText(h) {
+  if (!isNum(h)) return "--"; if (h > 99) return "> 99 h";
+  const m = Math.round(h * 60); if (m < 60) return m + "<small> min</small>";
+  return Math.floor(m / 60) + "<small> h</small>" + (m % 60 ? " " + (m % 60) + "<small> min</small>" : "");
+}
+function etaText(iso) {
+  const d = new Date(iso); if (!Number.isFinite(d.getTime())) return "";
+  const now = new Date(), tom = new Date(now); tom.setDate(now.getDate() + 1);
+  const t = d.toLocaleTimeString([], {hour: "numeric", minute: "2-digit"});
+  if (sameDay(d, now)) return "at " + t;
+  if (sameDay(d, tom)) return "tomorrow " + t;
+  return d.toLocaleDateString([], {weekday: "short"}) + " " + t;
+}
 const setDot = cls => { $("statusDot").className = "dot " + cls; };
 
 let latest = {};
@@ -793,12 +871,21 @@ async function updateSummary() {
     }
     const b = s.battery;
     if (b) {
+      const charging = b.state === "charging";
+      $("runtimeTitle").textContent = b.state === "idle" ? "Battery runtime" : charging ? "Time to full" : "Time to empty";
       if (b.state === "idle") { $("runtime").textContent = "idle"; $("runtimeLabel").textContent = "battery power below 25 W"; }
-      else {
-        $("runtime").textContent = b.hours > 99 ? "> 99 h" : b.hours + " h";
-        $("runtimeLabel").textContent = b.state === "discharging" ? "to empty at current load" : "to full at current charge rate";
+      else if (!isNum(b.hours)) {
+        $("runtime").textContent = "--";
+        $("runtimeLabel").textContent = "estimating · waiting for SOC to move" + (s.battery_capacity_kwh ? "" : " (or set battery_capacity_kwh)");
+      } else {
+        $("runtime").innerHTML = durationText(b.hours);
+        const when = b.hours > 99 ? null : (charging ? "full " : "empty ") + etaText(b.eta);
+        const how = b.method === "trend"
+          ? "SOC " + (charging ? "rising" : "falling") + (isNum(b.soc_rate) ? " " + Math.abs(b.soc_rate).toFixed(1) + " %/h" : "")
+          : "at current " + (charging ? "charge rate" : "load");
+        $("runtimeLabel").textContent = [when, how].filter(Boolean).join(" · ");
       }
-    }
+    } else { $("runtime").textContent = "--"; $("runtimeLabel").textContent = "no battery reading"; }
   } catch (e) { console.error("Error loading summary:", e); }
 }
 

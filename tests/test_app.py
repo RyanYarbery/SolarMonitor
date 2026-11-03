@@ -7,7 +7,7 @@ from pathlib import Path
 import app as webapp
 import settings
 from tests.helpers import cleanup_db, fresh_db
-from timeutil import now_utc, to_iso
+from timeutil import now_utc, parse_iso, to_iso
 
 
 class ApiTests(unittest.TestCase):
@@ -110,6 +110,8 @@ class SummaryTests(unittest.TestCase):
                 (to_iso(t + timedelta(seconds=10 * i)),),
             )
         self.conn.execute("UPDATE system_config SET value='10' WHERE key='battery_capacity_kwh'")
+        # flat SOC in the window -> no usable trend, so the capacity estimate applies
+        self.conn.execute("UPDATE system_samples SET battery_soc=60")
         self.conn.execute(
             "INSERT INTO daily_summary(date,pv_energy_wh,load_energy_wh,battery_soc_min) VALUES(?,12000,8000,45)",
             ((self.today - timedelta(days=1)).isoformat(),),
@@ -121,15 +123,55 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(s["today"]["battery_soc_min"], 60)
         self.assertEqual(s["yesterday"]["pv_energy_wh"], 12000)
         # discharging 1000 W at 60% of 10 kWh -> 6 h
-        self.assertEqual(s["battery"], {"state": "discharging", "hours": 6.0})
+        self.assertEqual(s["battery"]["state"], "discharging")
+        self.assertEqual(s["battery"]["hours"], 6.0)
+        self.assertEqual(s["battery"]["method"], "capacity")
+        eta = parse_iso(s["battery"]["eta"]) - now_utc()
+        self.assertAlmostEqual(eta.total_seconds() / 3600, 6.0, delta=0.05)
 
     def test_runtime_states(self):
-        self.assertIsNone(webapp.battery_runtime({"battery_soc": 50, "battery_watts": 100}, 0))
+        no_cfg = webapp.battery_runtime({"battery_soc": 50, "battery_watts": 100}, 0)
+        self.assertEqual(no_cfg["state"], "charging")
+        self.assertIsNone(no_cfg["hours"])
         self.assertEqual(
             webapp.battery_runtime({"battery_soc": 50, "battery_watts": 10}, 10)["state"], "idle"
         )
         charging = webapp.battery_runtime({"battery_soc": 50, "battery_watts": 2500}, 10)
-        self.assertEqual(charging, {"state": "charging", "hours": 2.0})
+        self.assertEqual((charging["state"], charging["hours"]), ("charging", 2.0))
+        self.assertEqual(charging["method"], "capacity")
+
+    def test_runtime_prefers_soc_trend(self):
+        reading = {"battery_soc": 44, "battery_watts": 2100}
+        trend = {"slope_pct_per_hour": 14.0, "soc_change": 4.0, "span_seconds": 1200}
+        r = webapp.battery_runtime(reading, 10, trend)
+        self.assertEqual(r["method"], "trend")
+        self.assertEqual(r["hours"], 4.0)  # 56 % left at 14 %/h
+        self.assertEqual(r["soc_rate"], 14.0)
+        # a falling SOC cannot predict time-to-full; fall back to capacity
+        falling = dict(trend, slope_pct_per_hour=-5.0)
+        self.assertEqual(webapp.battery_runtime(reading, 10, falling)["method"], "capacity")
+        # too little movement to trust the fit
+        flat = dict(trend, soc_change=0.5)
+        self.assertEqual(webapp.battery_runtime(reading, 10, flat)["method"], "capacity")
+        self.assertIsNone(webapp.battery_runtime(reading, 0, flat)["hours"])
+
+    def test_soc_trend_fit(self):
+        self.conn.execute("DELETE FROM system_samples")
+        now = now_utc()
+        rows = []
+        for i in range(120):  # 20 min of 10 s samples, SOC rising 12 %/h in 1 % steps
+            t = now - timedelta(minutes=20) + timedelta(seconds=10 * i)
+            rows.append((to_iso(t), int(40 + (i * 10 / 3600) * 12), 2000.0))
+        self.conn.executemany(
+            "INSERT INTO system_samples(timestamp,battery_soc,battery_watts) VALUES(?,?,?)", rows
+        )
+        self.conn.commit()
+        trend = webapp.soc_trend(self.conn)
+        self.assertAlmostEqual(trend["slope_pct_per_hour"], 12.0, delta=1.0)
+        self.assertEqual(trend["soc_change"], 3.0)
+        s = self.client.get("/api/summary").get_json()
+        self.assertEqual(s["battery"]["method"], "trend")
+        self.assertAlmostEqual(s["battery"]["hours"], 56 / 12, delta=0.5)
 
     def test_days_json_and_csv(self):
         self.conn.execute(
