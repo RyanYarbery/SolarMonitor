@@ -671,35 +671,35 @@ __BASE_CSS__
 
 <header class="topbar">
   <div class="brand">Solar Monitor</div>
-  <nav><a href="/" class="active">Live</a><a href="/days">Daily table</a></nav>
+  <nav><a href="/" class="active">Live</a><a href="/days">Daily Table</a></nav>
   <div class="status"><span class="dot" id="statusDot"></span><span id="status">Waiting for telemetry…</span></div>
 </header>
 <div class="banner" id="banner"></div>
 
 <div class="tiles">
-  <div class="tile solar"><div class="label">Solar production</div>
+  <div class="tile solar"><div class="label">Solar Production</div>
     <div class="value num" id="pvWatts">--</div>
-    <div class="sub num" id="pvSub">today -- · yesterday --</div></div>
-  <div class="tile load"><div class="label">House load</div>
+    <div class="sub num" id="pvSub">Today -- · Yesterday --</div></div>
+  <div class="tile load"><div class="label">House Load</div>
     <div class="value num" id="loadWatts">--</div>
-    <div class="sub num" id="loadSub">today -- · yesterday --</div></div>
+    <div class="sub num" id="loadSub">Today -- · Yesterday --</div></div>
   <div class="tile battery"><div class="label">Battery</div>
     <div class="value num" id="batterySoc">--</div>
     <div class="bar-track"><div class="bar-fill" id="socBar"></div></div>
     <div class="sub num" id="batterySub">--</div></div>
-  <div class="tile"><div class="label">Utility / AC input</div>
+  <div class="tile"><div class="label">Utility / AC Input</div>
     <div class="value" id="grid">--</div>
     <div class="sub num" id="gridLabel"></div></div>
 </div>
 
 <div class="tiles secondary" style="margin-top:12px">
-  <div class="tile"><div class="label">Peak solar today</div><div class="value num" id="pvPeak">--</div>
-    <div class="sub num" id="pvPeakLabel">yesterday --</div></div>
-  <div class="tile"><div class="label" id="runtimeTitle">Battery runtime</div><div class="value num" id="runtime">--</div>
+  <div class="tile"><div class="label">Peak Solar Today</div><div class="value num" id="pvPeak">--</div>
+    <div class="sub num" id="pvPeakLabel">Yesterday --</div></div>
+  <div class="tile"><div class="label" id="runtimeTitle">Battery Runtime</div><div class="value num" id="runtime">--</div>
     <div class="sub" id="runtimeLabel">--</div></div>
-  <div class="tile"><div class="label">Lowest SOC today</div><div class="value num" id="socMinToday">--</div>
-    <div class="sub num" id="socMinYesterday">yesterday --</div></div>
-  <div class="tile"><div class="label">Yesterday's performance</div><div class="value num" id="prYesterday">--</div>
+  <div class="tile"><div class="label">Lowest SOC Today</div><div class="value num" id="socMinToday">--</div>
+    <div class="sub num" id="socMinYesterday">Yesterday --</div></div>
+  <div class="tile"><div class="label">Yesterday's Performance</div><div class="value num" id="prYesterday">--</div>
     <div class="sub" id="prLabel"></div></div>
 </div>
 
@@ -709,12 +709,12 @@ __BASE_CSS__
 <div class="history-head">
   <h2 id="historyTitle">Last 24 hours</h2>
   <div class="ranges" id="ranges">
-    <button data-hours="1">1h</button><button data-hours="6">6h</button>
-    <button data-hours="24" class="active">24h</button><button data-hours="168">7d</button>
-    <button data-hours="336">2w</button><button data-hours="720">1m</button>
-    <button data-hours="2160">3m</button><button data-hours="4320">6m</button>
-    <button data-hours="8760">1y</button><button data-hours="17520">2y</button>
-    <button data-hours="26280">3y</button>
+    <button data-hours="1">1H</button><button data-hours="6">6H</button>
+    <button data-hours="24" class="active">24H</button><button data-hours="168">7D</button>
+    <button data-hours="336">2W</button><button data-hours="720">1M</button>
+    <button data-hours="2160">3M</button><button data-hours="4320">6M</button>
+    <button data-hours="8760">1Y</button><button data-hours="17520">2Y</button>
+    <button data-hours="26280">3Y</button>
   </div>
 </div>
 
@@ -724,19 +724,19 @@ __BASE_CSS__
   <canvas id="powerChart" role="img" aria-label="Solar production and house load over time"></canvas><div class="tip" id="powerTip"></div>
 </div>
 <div class="card chart-card">
-  <div class="chart-head"><div class="chart-title">Battery state of charge</div>
+  <div class="chart-head"><div class="chart-title">Battery State of Charge</div>
     <div class="legend" id="socLegend"></div></div>
   <canvas id="socChart" role="img" aria-label="Battery state of charge over time"></canvas><div class="tip" id="socTip"></div>
 </div>
 
-<h2>Recent events</h2>
+<h2>Recent Events</h2>
 <div class="card events-wrap"><table class="events"><tbody id="events"><tr><td class="muted">No events recorded.</td></tr></tbody></table></div>
 
 <script>
 "use strict";
 let historyHours = 24;
-const LABELS = {1:"Last hour",6:"Last 6 hours",24:"Last 24 hours",168:"Last 7 days",336:"Last 2 weeks",
-  720:"Last month",2160:"Last 3 months",4320:"Last 6 months",8760:"Last year",17520:"Last 2 years",26280:"Last 3 years"};
+const LABELS = {1:"Last Hour",6:"Last 6 Hours",24:"Last 24 Hours",168:"Last 7 Days",336:"Last 2 Weeks",
+  720:"Last Month",2160:"Last 3 Months",4320:"Last 6 Months",8760:"Last Year",17520:"Last 2 Years",26280:"Last 3 Years"};
 const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -768,6 +768,8 @@ function etaText(iso) {
   if (sameDay(d, tom)) return "tomorrow " + t;
   return d.toLocaleDateString([], {weekday: "short"}) + " " + t;
 }
+const cap = s => { s = String(s ?? ""); return s.charAt(0).toUpperCase() + s.slice(1); };
+const sourceText = s => String(s ?? "").replace(/_/g, " ").replace(/^eg4\b/i, "EG4");
 const setDot = cls => { $("statusDot").className = "dot " + cls; };
 
 let latest = {};
@@ -785,18 +787,18 @@ async function updateDashboard() {
     fill.style.width = isNum(d.battery_soc) ? Math.max(0, Math.min(100, soc)) + "%" : "0";
     fill.className = "bar-fill" + (soc < 25 ? " bad" : soc < 40 ? " warn" : "");
     const bw = Number(d.battery_watts);
-    const flow = !isNum(d.battery_watts) ? "" : Math.abs(bw) < 25 ? "idle" : bw > 0 ? "charging at " + watts(bw) : "discharging at " + watts(-bw);
+    const flow = !isNum(d.battery_watts) ? "" : Math.abs(bw) < 25 ? "Idle" : bw > 0 ? "Charging at " + watts(bw) : "Discharging at " + watts(-bw);
     $("batterySub").textContent = [fmt(d.battery_voltage, 1, " V"), flow].filter(Boolean).join(" · ");
     if (d.grid_present === true) {
       $("grid").textContent = "On";
       $("gridLabel").textContent = fmt(d.grid_voltage, 0, " V") + " at the input";
     } else if (d.grid_present === false) {
       $("grid").textContent = "Off";
-      $("gridLabel").textContent = "running on solar and battery";
+      $("gridLabel").textContent = "Running on solar and battery";
     } else { $("grid").textContent = "--"; $("gridLabel").textContent = ""; }
     const when = new Date(d.timestamp);
     $("status").textContent = "Updated " + (Number.isFinite(when.getTime()) ? when.toLocaleTimeString([], {hour: "numeric", minute: "2-digit", second: "2-digit"}) : d.timestamp)
-      + " · " + d.inverter_count + " inverters · " + d.source;
+      + " · " + d.inverter_count + " inverters · " + sourceText(d.source);
     document.body.classList.toggle("stale", !!d.stale);
     document.title = (isNum(d.pv_watts) ? (d.pv_watts / 1000).toFixed(1) + " kW · " : "") + (isNum(d.battery_soc) ? Math.round(d.battery_soc) + "% · " : "") + "Solar Monitor";
     banner.className = "banner";
@@ -820,18 +822,18 @@ function inverterCard(inv) {
   const row = (k, v, small) => `<div class="row"><span class="k">${k}</span><span class="v num${v === "fault" ? " fault" : ""}">${v}${small ? `<small>${small}</small>` : ""}</span></div>`;
   return `<div class="card inv">
     <div class="inv-head"><h3>Inverter ${esc(inv.inverter_id)}</h3>
-      <span class="chip" title="mode ${esc(inv.mode || "?")}">${esc((inv.mode_name || "--").replace(/_/g, " "))}</span>
-      ${faulted ? `<span class="chip fault">Fault ${esc(inv.fault_code)}</span>` : `<span class="chip ok">no fault</span>`}
-      <span class="chip">PV ${esc(inv.pv_quality)}</span></div>
+      <span class="chip" title="Mode ${esc(inv.mode || "?")}">${esc(cap((inv.mode_name || "--").replace(/_/g, " ")))}</span>
+      ${faulted ? `<span class="chip fault">Fault ${esc(inv.fault_code)}</span>` : `<span class="chip ok">No fault</span>`}
+      <span class="chip">PV ${esc(cap(inv.pv_quality))}</span></div>
     <div class="kv">
       ${row("Output", watts(inv.output_watts), fmt(inv.load_percent, 0, "% load"))}
-      ${row("PV total", watts(inv.pv_watts), fmt(inv.pv_voltage, 0, " V"))}
-      ${row("PV string 1", watts(inv.pv1_watts), fmt(inv.pv1_voltage, 0, " V") + " · " + fmt(inv.pv1_current, 1, " A"))}
-      ${row("PV string 2", watts(inv.pv2_watts), fmt(inv.pv2_voltage, 0, " V") + " · " + fmt(inv.pv2_current, 1, " A"))}
-      ${row("AC output", fmt(inv.output_voltage, 1, " V"), fmt(inv.output_frequency, 1, " Hz"))}
+      ${row("PV Total", watts(inv.pv_watts), fmt(inv.pv_voltage, 0, " V"))}
+      ${row("PV String 1", watts(inv.pv1_watts), fmt(inv.pv1_voltage, 0, " V") + " · " + fmt(inv.pv1_current, 1, " A"))}
+      ${row("PV String 2", watts(inv.pv2_watts), fmt(inv.pv2_voltage, 0, " V") + " · " + fmt(inv.pv2_current, 1, " A"))}
+      ${row("AC Output", fmt(inv.output_voltage, 1, " V"), fmt(inv.output_frequency, 1, " Hz"))}
       ${row("Battery", fmt(inv.battery_voltage, 1, " V"), fmt(inv.battery_soc, 0, "%"))}
       ${row("Temperature", fmt(inv.inverter_temperature_c, 0, " °C"))}
-      ${row("Last sample", esc(whenText(inv.timestamp)))}
+      ${row("Last Sample", esc(whenText(inv.timestamp)))}
     </div></div>`;
 }
 
@@ -850,42 +852,42 @@ async function updateSummary() {
     if (!r.ok) throw new Error("HTTP " + r.status);
     const s = await r.json();
     const y = s.yesterday;
-    $("pvSub").textContent = "today " + kwh(s.today.pv_wh) + " · yesterday " + (y ? kwh(y.pv_energy_wh) : "--");
-    $("loadSub").textContent = "today " + kwh(s.today.load_wh) + " · yesterday " + (y ? kwh(y.load_energy_wh) : "--");
+    $("pvSub").textContent = "Today " + kwh(s.today.pv_wh) + " · Yesterday " + (y ? kwh(y.pv_energy_wh) : "--");
+    $("loadSub").textContent = "Today " + kwh(s.today.load_wh) + " · Yesterday " + (y ? kwh(y.load_energy_wh) : "--");
     $("socMinToday").textContent = fmt(s.today.battery_soc_min, 0, "%");
-    $("socMinYesterday").textContent = "yesterday " + (y ? fmt(y.battery_soc_min, 0, "%") : "--");
+    $("socMinYesterday").textContent = "Yesterday " + (y ? fmt(y.battery_soc_min, 0, "%") : "--");
     const pk = s.today.pv_peak_watts;
     $("pvPeak").textContent = isNum(pk) && pk > 0 ? watts(pk) : "--";
     $("pvPeakLabel").textContent = [
-      isNum(pk) && pk > 0 && s.today.pv_peak_time ? "at " + timeText(s.today.pv_peak_time) : null,
-      "yesterday " + (y && isNum(y.pv_peak_watts) ? watts(y.pv_peak_watts) : "--"),
+      isNum(pk) && pk > 0 && s.today.pv_peak_time ? "At " + timeText(s.today.pv_peak_time) : null,
+      "Yesterday " + (y && isNum(y.pv_peak_watts) ? watts(y.pv_peak_watts) : "--"),
     ].filter(Boolean).join(" · ");
     if (y && isNum(y.performance_ratio)) {
       $("prYesterday").textContent = (y.performance_ratio * 100).toFixed(0) + "%";
-      $("prLabel").textContent = "of nameplate × " + (y.insolation_wh_m2 / 1000).toFixed(2) + " kWh/m² insolation";
+      $("prLabel").textContent = "Of nameplate × " + (y.insolation_wh_m2 / 1000).toFixed(2) + " kWh/m² insolation";
     } else {
       $("prYesterday").textContent = "--";
-      $("prLabel").textContent = !s.installed_pv_kw ? "set installed_pv_kw to enable"
-        : !s.has_coordinates ? "set latitude and longitude to enable"
-        : !y ? "no summary for yesterday yet" : "no insolation data for yesterday";
+      $("prLabel").textContent = !s.installed_pv_kw ? "Set installed_pv_kw to enable"
+        : !s.has_coordinates ? "Set latitude and longitude to enable"
+        : !y ? "No summary for yesterday yet" : "No insolation data for yesterday";
     }
     const b = s.battery;
     if (b) {
       const charging = b.state === "charging";
-      $("runtimeTitle").textContent = b.state === "idle" ? "Battery runtime" : charging ? "Time to full" : "Time to empty";
-      if (b.state === "idle") { $("runtime").textContent = "idle"; $("runtimeLabel").textContent = "battery power below 25 W"; }
+      $("runtimeTitle").textContent = b.state === "idle" ? "Battery Runtime" : charging ? "Time to Full" : "Time to Empty";
+      if (b.state === "idle") { $("runtime").textContent = "Idle"; $("runtimeLabel").textContent = "Battery power below 25 W"; }
       else if (!isNum(b.hours)) {
         $("runtime").textContent = "--";
-        $("runtimeLabel").textContent = "estimating · waiting for SOC to move" + (s.battery_capacity_kwh ? "" : " (or set battery_capacity_kwh)");
+        $("runtimeLabel").textContent = "Estimating · Waiting for SOC to move" + (s.battery_capacity_kwh ? "" : " (or set battery_capacity_kwh)");
       } else {
         $("runtime").innerHTML = durationText(b.hours);
-        const when = b.hours > 99 ? null : (charging ? "full " : "empty ") + etaText(b.eta);
+        const when = b.hours > 99 ? null : (charging ? "Full " : "Empty ") + etaText(b.eta);
         const how = b.method === "trend"
           ? "SOC " + (charging ? "rising" : "falling") + (isNum(b.soc_rate) ? " " + Math.abs(b.soc_rate).toFixed(1) + " %/h" : "")
-          : "at current " + (charging ? "charge rate" : "load");
+          : "At current " + (charging ? "charge rate" : "load");
         $("runtimeLabel").textContent = [when, how].filter(Boolean).join(" · ");
       }
-    } else { $("runtime").textContent = "--"; $("runtimeLabel").textContent = "no battery reading"; }
+    } else { $("runtime").textContent = "--"; $("runtimeLabel").textContent = "No battery reading"; }
   } catch (e) { console.error("Error loading summary:", e); }
 }
 
@@ -898,8 +900,8 @@ async function updateEvents() {
     if (!events.length) { body.innerHTML = '<tr><td class="muted">No events recorded.</td></tr>'; return; }
     body.innerHTML = events.map(ev => `<tr>
       <td class="time" title="${esc(new Date(ev.timestamp).toLocaleString())}">${esc(whenText(ev.timestamp))}</td>
-      <td class="type"><span class="sev ${esc(ev.severity)}"></span>${esc(String(ev.event_type || "").replace(/_/g, " "))}</td>
-      <td>${esc(ev.message)}${ev.inverter_id ? ` <span class="chip">inverter ${esc(ev.inverter_id)}</span>` : ""}</td></tr>`).join("");
+      <td class="type"><span class="sev ${esc(ev.severity)}"></span>${esc(cap(String(ev.event_type || "").replace(/_/g, " ")))}</td>
+      <td>${esc(ev.message)}${ev.inverter_id ? ` <span class="chip">Inverter ${esc(ev.inverter_id)}</span>` : ""}</td></tr>`).join("");
   } catch (e) { console.error("Error loading events:", e); }
 }
 
@@ -1105,7 +1107,7 @@ class Chart {
         const r2 = document.createElement("div"); r2.className = "r";
         const sw2 = document.createElement("i"); sw2.style.background = css(s.color); sw2.style.opacity = 0.4;
         const b2 = document.createElement("b"); b2.textContent = val(p[s.band[1]]);
-        const l2 = document.createElement("span"); l2.textContent = s.bandLabel || "highest";
+        const l2 = document.createElement("span"); l2.textContent = s.bandLabel || "Highest";
         r2.append(sw2, b2, l2); tip.appendChild(r2);
       }
     }
@@ -1127,20 +1129,20 @@ async function updateHistoryCharts() {
     const payload = await r.json();
     const points = payload.points || [];
     const energy = payload.mode === "daily_energy", bucket = payload.bucket || "day";
-    $("powerTitle").textContent = !energy ? "Power" : bucket === "day" ? "Energy per day"
-      : "Energy per day, " + (bucket === "week" ? "weekly" : "monthly") + " average";
+    $("powerTitle").textContent = !energy ? "Power" : bucket === "day" ? "Energy per Day"
+      : "Energy per Day, " + (bucket === "week" ? "Weekly" : "Monthly") + " Average";
     $("pvLegend").textContent = energy ? "Solar kWh" : "Solar";
     $("loadLegend").textContent = energy ? "Load kWh" : "Load";
     powerChart.setData(points, [
-      {key: "pv_value", color: "--solar", label: "solar", fill: true, bars: true},
-      {key: "load_value", color: "--load", label: "load"},
+      {key: "pv_value", color: "--solar", label: "Solar", fill: true, bars: true},
+      {key: "load_value", color: "--load", label: "Load"},
     ], energy ? "kWh" : "W", energy ? "bars" : "line", energy ? bucket : undefined);
     // Daily buckets carry a min/max: show the lowest SOC with each day's swing
     // shaded, which is what matters on an off-grid system.
     const ranged = energy && points.some(p => isNum(p.battery_soc_min) && isNum(p.battery_soc_max));
-    $("socLegend").textContent = ranged ? "line: lowest · shaded: range" : "";
+    $("socLegend").textContent = ranged ? "Line: lowest · Shaded: range" : "";
     socChart.setData(points, ranged
-      ? [{key: "battery_soc_min", color: "--soc", label: "lowest", band: ["battery_soc_min", "battery_soc_max"]}]
+      ? [{key: "battery_soc_min", color: "--soc", label: "Lowest", band: ["battery_soc_min", "battery_soc_max"]}]
       : [{key: "battery_soc", color: "--soc", label: "SOC", fill: true}], "%", "line", energy ? bucket : undefined);
   } catch (e) { console.error("Error loading history:", e); }
 }
@@ -1206,12 +1208,12 @@ __BASE_CSS__
 <body>
 <header class="topbar">
   <div class="brand">Solar Monitor</div>
-  <nav><a href="/">Live</a><a href="/days" class="active">Daily table</a></nav>
+  <nav><a href="/">Live</a><a href="/days" class="active">Daily Table</a></nav>
 </header>
 <div class="controls">
   <label>Range <select id="range">
-    <option value="30">30 days</option><option value="90" selected>90 days</option>
-    <option value="365">1 year</option><option value="3660">All</option></select></label>
+    <option value="30">30 Days</option><option value="90" selected>90 Days</option>
+    <option value="365">1 Year</option><option value="3660">All</option></select></label>
   <a class="btn" id="csv" href="/api/days.csv?days=90">Download CSV</a>
   <span class="muted" id="count"></span>
 </div>
@@ -1219,11 +1221,11 @@ __BASE_CSS__
 <div class="wrap"><table>
 <thead>
 <tr><th class="group"></th><th class="group" colspan="4">Energy, kWh</th><th class="group" colspan="2">Battery, kWh</th>
-    <th class="group" colspan="2">Production</th><th class="group" colspan="2">SOC</th><th class="group" colspan="2">Battery use</th><th class="group" colspan="3">Performance</th></tr>
+    <th class="group" colspan="2">Production</th><th class="group" colspan="2">SOC</th><th class="group" colspan="2">Battery Use</th><th class="group" colspan="3">Performance</th></tr>
 <tr>
   <th>Date</th><th>Solar</th><th>Load</th><th>Inv 1</th><th>Inv 2</th>
   <th>Charge</th><th>Discharge</th><th>Peak W</th><th>Hours</th>
-  <th>SOC min</th><th>SOC max</th><th>RTE</th><th>Cycles</th><th>Yield kWh/kW</th>
+  <th>SOC Min</th><th>SOC Max</th><th>RTE</th><th>Cycles</th><th>Yield kWh/kW</th>
   <th>Insolation kWh/m²</th><th>PR</th>
 </tr></thead>
 <tbody id="rows"><tr><td colspan="16" class="muted">Loading…</td></tr></tbody>
@@ -1251,12 +1253,12 @@ async function load() {
   const prs = rows.map(x => x.performance_ratio).filter(v => v != null), socs = rows.map(x => x.battery_soc_min).filter(v => v != null);
   document.getElementById("count").textContent = rows.length ? rows.length + " completed days" : "";
   document.getElementById("totals").innerHTML = rows.length ? [
-    tile("Solar total", k(pv.reduce((a, b) => a + b, 0)) + " kWh", "avg " + k(avg(pv)) + " kWh/day"),
-    tile("Load total", k(ld.reduce((a, b) => a + b, 0)) + " kWh", "avg " + k(avg(ld)) + " kWh/day"),
-    tile("Best day", best ? k(best.pv_energy_wh) + " kWh" : "--", best ? best.date : ""),
+    tile("Solar Total", k(pv.reduce((a, b) => a + b, 0)) + " kWh", "Avg " + k(avg(pv)) + " kWh/day"),
+    tile("Load Total", k(ld.reduce((a, b) => a + b, 0)) + " kWh", "Avg " + k(avg(ld)) + " kWh/day"),
+    tile("Best Day", best ? k(best.pv_energy_wh) + " kWh" : "--", best ? best.date : ""),
     tile("Lowest SOC", socs.length ? Math.min(...socs).toFixed(0) + "%" : "--",
-         socs.length ? rows.find(x => x.battery_soc_min === Math.min(...socs)).date : "across the range"),
-    tile("Avg performance ratio", prs.length ? pct(avg(prs)) : "--", prs.length ? prs.length + " days with insolation" : "needs weather data"),
+         socs.length ? rows.find(x => x.battery_soc_min === Math.min(...socs)).date : "Across the range"),
+    tile("Avg Performance Ratio", prs.length ? pct(avg(prs)) : "--", prs.length ? prs.length + " days with insolation" : "Needs weather data"),
   ].join("") : "";
   document.getElementById("rows").innerHTML = rows.length ? rows.map(x => `<tr>
     <td>${esc(x.date)}<span class="wd">${weekday(x.date)}</span></td>
