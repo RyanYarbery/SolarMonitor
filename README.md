@@ -1,8 +1,6 @@
 # SolarMonitor
 
-SolarMonitor is a lightweight local telemetry, aggregation, retention, and dashboard stack for EG4 off-grid solar systems.
-
-It runs continuously on low-resource hardware, collecting live data from two EG4 6500EX-48 inverters over the PI30 serial protocol. Raw telemetry is stored in SQLite, rolled into multiple historical resolutions, and served through a Flask dashboard.
+SolarMonitor is a small, local monitoring system for an EG4 off-grid solar setup. It reads two EG4 6500EX-48 inverters over their serial port, stores the readings in SQLite, rolls them up into minute, 15-minute, daily, monthly and yearly summaries, and serves a dashboard you can open from a phone or laptop on the home network. It runs on a Raspberry Pi 1 and needs no cloud service.
 
 ## Goals
 
@@ -13,13 +11,93 @@ It runs continuously on low-resource hardware, collecting live data from two EG4
 - A lightweight browser dashboard suitable for old Raspberry Pi hardware
 - Clear separation between raw measurements, derived summaries, and presentation
 
-## Current hardware target
+## Hardware and requirements
 
 - 2 x EG4 6500EX-48 inverters in parallel
 - EG4 LifePower battery bank
 - Raspberry Pi 1 Model B Rev 2
 - USB FTDI serial adapter
 - Raspbian / Debian-based Linux, Python 3.9 or newer
+
+The collector speaks the PI30 protocol used by many hybrid inverters, but it has only been tested on this pair of EG4 6500EX-48 units. A single inverter, or a different model, will likely need changes in `eg4.py` and `collector.py`.
+
+Python packages: Flask and pyserial (`requirements.txt`). Weather data comes from [Open-Meteo](https://open-meteo.com) (free, no key), and push alerts are optional through [ntfy](https://ntfy.sh).
+
+## Installation
+
+```bash
+git clone https://github.com/RyanYarbery/SolarMonitor.git /opt/solar-monitor
+cd /opt/solar-monitor
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+New installation:
+
+```bash
+python init_db.py
+python configure.py installed_pv_kw <kW>
+python configure.py battery_capacity_kwh <kWh>
+```
+
+Upgrading an existing installation (stop the services first):
+
+```bash
+sudo systemctl stop solar-collector.service solar-aggregator.timer solar-dashboard.service
+python migrate_v3.py        # writes solar_v1.db.before-v3 as a backup
+```
+
+Install the units. They assume `/opt/solar-monitor` and a `solar` service account; adjust if needed. The collector unit declares `RuntimeDirectory=solar-monitor`, which creates the live snapshot directory.
+
+```bash
+sudo cp systemd/solar-monitor.env.example /etc/solar-monitor.env   # edit as needed
+sudo cp systemd/*.service systemd/*.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now solar-collector.service
+sudo systemctl enable --now solar-dashboard.service
+sudo systemctl enable --now solar-aggregator.timer
+sudo systemctl enable --now solar-weather.timer
+sudo systemctl enable --now solar-backup.timer
+```
+
+Check status:
+
+```bash
+systemctl status solar-collector.service solar-dashboard.service solar-aggregator.timer
+journalctl -u solar-collector.service -f
+```
+
+## Configuration
+
+Operational settings are environment variables, read by `settings.py`. The systemd units load them from `/etc/solar-monitor.env`; a template is in `systemd/solar-monitor.env.example`.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SOLAR_DB_PATH` | `solar_v1.db` | SQLite database |
+| `SOLAR_LIVE_PATH` | `/run/solar-monitor/latest.json` | Live snapshot |
+| `SOLAR_SERIAL_PORT` | `/dev/ttyUSB0` | Serial device |
+| `SOLAR_SERIAL_BAUD` | `2400` | |
+| `SOLAR_SERIAL_TIMEOUT` | `3.0` | Seconds to wait for a reply |
+| `SOLAR_SERIAL_COMMAND_GAP` | `0.2` | Seconds between commands |
+| `SOLAR_SERIAL_STRICT_CRC` | `1` | Reject frames with bad CRC |
+| `SOLAR_SAMPLE_INTERVAL` | `10` | Seconds between cycles |
+| `SOLAR_STALE_AFTER` | `60` | Seconds before a reading is stale |
+| `SOLAR_RAW_RETENTION_DAYS` | `7` | 0 keeps forever |
+| `SOLAR_MINUTE_RETENTION_DAYS` | `365` | 0 keeps forever |
+| `SOLAR_DASHBOARD_HOST` / `PORT` | `0.0.0.0` / `5000` | |
+| `SOLAR_NTFY_URL` | empty | ntfy topic URL; empty disables alerts |
+| `SOLAR_NTFY_TOKEN` | empty | Bearer token for a protected topic |
+| `SOLAR_ALERT_COOLDOWN` | `1800` | Seconds between repeats of the same alert |
+| `SOLAR_LOW_SOC_CLEAR_MARGIN` | `5.0` | Percent above the low-SOC threshold before that alert clears |
+| `SOLAR_STALE_ALERT_AFTER` | `600` | Aggregator alerts when newest sample is older |
+| `SOLAR_GRID_ON_VOLTS` / `OFF_VOLTS` | `100` / `80` | AC input present/absent thresholds |
+| `SOLAR_BACKUP_DIR` | `backups` | Put this on a different device |
+| `SOLAR_BACKUP_KEEP` | `14` | Backups to retain |
+| `SOLAR_BACKUP_COMMAND` | empty | Shell command run after a backup, `{path}` substituted |
+| `SOLAR_WEATHER_PAST_DAYS` | `2` | Days of past weather fetched each hour |
+
+Plant facts (array size, battery capacity, coordinates, low-battery alert level) live in the database instead and are set with `configure.py`; see [Incremental aggregation](#incremental-aggregation) and [Weather normalisation](#weather-normalisation).
 
 ## Architecture
 
@@ -87,7 +165,9 @@ Set `SOLAR_NTFY_URL` to a topic such as `https://ntfy.sh/your-unguessable-topic`
 ```bash
 set -a; source /etc/solar-monitor.env; set +a
 python alerts.py --test
-``` Each alert key has a cooldown (default 30 minutes) tracked in the `alert_state` table, and a recovery message is sent when the condition clears. The aggregator, which runs from a timer, additionally alerts when the newest sample is older than `SOLAR_STALE_ALERT_AFTER` seconds, since a dead collector cannot report itself.
+```
+
+Each alert key has a cooldown (default 30 minutes) tracked in the `alert_state` table, and a recovery message is sent when the condition clears. The aggregator, which runs from a timer, additionally alerts when the newest sample is older than `SOLAR_STALE_ALERT_AFTER` seconds, since a dead collector cannot report itself.
 
 ### Watchdog
 
@@ -181,77 +261,6 @@ API endpoints: `/api/latest`, `/api/summary`, `/api/inverters`, `/api/events?lim
 
 The dashboard has no authentication. Keep it on a trusted network.
 
-## Configuration
-
-Operational settings are environment variables, read by `settings.py`. The systemd units load them from `/etc/solar-monitor.env`; a template is in `systemd/solar-monitor.env.example`.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `SOLAR_DB_PATH` | `solar_v1.db` | SQLite database |
-| `SOLAR_LIVE_PATH` | `/run/solar-monitor/latest.json` | Live snapshot |
-| `SOLAR_SERIAL_PORT` | `/dev/ttyUSB0` | Serial device |
-| `SOLAR_SERIAL_BAUD` | `2400` | |
-| `SOLAR_SERIAL_COMMAND_GAP` | `0.2` | Seconds between commands |
-| `SOLAR_SERIAL_STRICT_CRC` | `1` | Reject frames with bad CRC |
-| `SOLAR_SAMPLE_INTERVAL` | `10` | Seconds between cycles |
-| `SOLAR_STALE_AFTER` | `60` | Seconds before a reading is stale |
-| `SOLAR_RAW_RETENTION_DAYS` | `7` | 0 keeps forever |
-| `SOLAR_MINUTE_RETENTION_DAYS` | `365` | 0 keeps forever |
-| `SOLAR_DASHBOARD_HOST` / `PORT` | `0.0.0.0` / `5000` | |
-| `SOLAR_NTFY_URL` | empty | ntfy topic URL; empty disables alerts |
-| `SOLAR_NTFY_TOKEN` | empty | Bearer token for a protected topic |
-| `SOLAR_ALERT_COOLDOWN` | `1800` | Seconds between repeats of the same alert |
-| `SOLAR_STALE_ALERT_AFTER` | `600` | Aggregator alerts when newest sample is older |
-| `SOLAR_GRID_ON_VOLTS` / `OFF_VOLTS` | `100` / `80` | AC input present/absent thresholds |
-| `SOLAR_BACKUP_DIR` | `backups` | Put this on a different device |
-| `SOLAR_BACKUP_KEEP` | `14` | Backups to retain |
-| `SOLAR_BACKUP_COMMAND` | empty | Shell command run after a backup, `{path}` substituted |
-
-## Installation
-
-```bash
-git clone https://github.com/RyanYarbery/SolarMonitor.git /opt/solar-monitor
-cd /opt/solar-monitor
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-New installation:
-
-```bash
-python init_db.py
-python configure.py installed_pv_kw <kW>
-python configure.py battery_capacity_kwh <kWh>
-```
-
-Upgrading an existing installation (stop the services first):
-
-```bash
-sudo systemctl stop solar-collector.service solar-aggregator.timer solar-dashboard.service
-python migrate_v3.py        # writes solar_v1.db.before-v3 as a backup
-```
-
-Install the units. They assume `/opt/solar-monitor` and a `solar` service account; adjust if needed. The collector unit declares `RuntimeDirectory=solar-monitor`, which creates the live snapshot directory.
-
-```bash
-sudo cp systemd/solar-monitor.env.example /etc/solar-monitor.env   # edit as needed
-sudo cp systemd/*.service systemd/*.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now solar-collector.service
-sudo systemctl enable --now solar-dashboard.service
-sudo systemctl enable --now solar-aggregator.timer
-sudo systemctl enable --now solar-weather.timer
-sudo systemctl enable --now solar-backup.timer
-```
-
-Check status:
-
-```bash
-systemctl status solar-collector.service solar-dashboard.service solar-aggregator.timer
-journalctl -u solar-collector.service -f
-```
-
 ## Troubleshooting
 
 - **`CRC mismatch on ...` in the collector log.** A frame was corrupted in transit and discarded. Occasional mismatches are normal on a long or noisy serial run. If every frame fails, run `python probe_inverter.py` to inspect raw bytes; if the inverter consistently sends a CRC that does not verify, set `SOLAR_SERIAL_STRICT_CRC=0` and open an issue with the probe output.
@@ -271,6 +280,14 @@ ruff format . && ruff check .
 
 The tests run with no hardware; `tests/test_eg4.py` holds recorded-style frames for the parsers.
 
-## License
+## Status
 
-No license has been selected yet.
+The `fable` branch is the current rewrite (schema v3, with tests) and runs on the reference hardware. `main` holds the older version until `fable` is merged; until then, clone with `git clone -b fable`. The dashboard is still changing.
+
+## Licence
+
+No licence has been chosen yet.
+
+## About this project
+
+This is a personal project, built for one off-grid system and shared as-is in case it helps someone with similar equipment. It is not a product and comes with no support. It only reads from the inverters and never changes their settings.

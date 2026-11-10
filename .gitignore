@@ -37,7 +37,9 @@ config.private.json
 *.pfx
 *.crt
 
-# Backups
+# Backups (backup.py writes to backups/ by default)
+backups/
+*.db.gz
 *.bak
 *.backup
 *.old
@@ -55,3 +57,4 @@ Thumbs.db
 
 # Tooling
 .ruff_cache/
+.pytest_cache/
