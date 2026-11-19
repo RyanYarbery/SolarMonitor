@@ -27,6 +27,6 @@ Why things are the way they are. Read this before changing anything that looks d
 
 **Who decided:** decided in session, Ryan to confirm (it was included in the option he picked).
 
-**Why:** the Pi loses power when the bank reaches the inverters' low-voltage cutoff. A fresh `LowSocTracker` started with `low=False` on every reboot, so "Battery low" fired again after each one and the earlier alert was never cleared. On 2026-11-19 that left two open alerts and no recovery. `SocSourceDetector` is seeded the same way.
+**Why:** the Pi loses power when the bank reaches the inverters' low-voltage cutoff. A fresh `LowSocTracker` started with `low=False` on every reboot, so "Battery low" fired again after each one and the earlier alert was never cleared. On 2026-11-19 that left two open alerts and no recovery. `SocSourceDetector` is seeded the same way. `GridTracker` is seeded with `present=True` while the `grid_present` alert is active, so AC that went away during a restart is reported as off. On 2026-11-19 "Utility power on" had stayed active from 05:12 with 0 V at the input. It is not seeded when the alert is inactive, so a first start stays silent as before.
 
 **Revisit if:** the Pi gets power that survives the inverters shutting down; then a reboot no longer coincides with low battery.

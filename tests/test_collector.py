@@ -158,6 +158,14 @@ class GridTrackerTests(unittest.TestCase):
         self.assertTrue(t.present)
         self.assertEqual(t.update(0.0), "off")
 
+    def test_seeded_present_clears_when_ac_gone_after_restart(self):
+        t = collector.GridTracker(present=True)
+        self.assertEqual(t.update(0.0), "off")
+
+    def test_seeded_present_stays_quiet_when_ac_still_on(self):
+        t = collector.GridTracker(present=True)
+        self.assertIsNone(t.update(121.0))
+
     def test_system_sample_carries_grid_voltage(self):
         s = collector.build_system_sample([inv(1, grid_voltage=0.0), inv(2, grid_voltage=119.5)])
         self.assertEqual(s["grid_voltage"], 119.5)

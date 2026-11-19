@@ -376,13 +376,18 @@ class GridTracker:
     """Detects utility/generator AC appearing at or disappearing from the input.
 
     Hysteresis: present at or above GRID_ON_VOLTS, absent below GRID_OFF_VOLTS.
-    The first cycle only records the initial state and emits nothing.
+    The first cycle only records the initial state and emits nothing, unless
+    `present` is seeded: main() passes True when the grid_present alert is
+    still active, so AC that went away across a restart is reported as off
+    and the alert clears (it stayed stuck on 2026-11-19 otherwise).
     """
 
-    def __init__(self, on_volts=settings.GRID_ON_VOLTS, off_volts=settings.GRID_OFF_VOLTS):
+    def __init__(
+        self, on_volts=settings.GRID_ON_VOLTS, off_volts=settings.GRID_OFF_VOLTS, present=None
+    ):
         self.on_volts = on_volts
         self.off_volts = off_volts
-        self.present = None
+        self.present = present
 
     def update(self, grid_voltage):
         """Return 'on', 'off' or None."""
@@ -530,7 +535,7 @@ def main():
         float(plant.get("low_soc_alert_percent") or 20), low=alerts.is_active(conn, "low_soc")
     )
     soc_source = SocSourceDetector("voltage" if alerts.is_active(conn, "soc_estimate") else None)
-    grid_tracker = GridTracker()
+    grid_tracker = GridTracker(present=True if alerts.is_active(conn, "grid_present") else None)
     failures = 0
     lost_reported = False
     cycles = 0
