@@ -5,9 +5,11 @@ single short transaction, publishes a live JSON snapshot, and records
 mode/fault transitions in the events table.
 """
 
+import collections
 import json
 import os
 import sqlite3
+import statistics
 import time
 import traceback
 
@@ -280,10 +282,13 @@ class StateTracker:
 class LowSocTracker:
     """Fires once when SOC drops below the threshold, clears with hysteresis."""
 
-    def __init__(self, threshold, clear_margin=settings.LOW_SOC_CLEAR_MARGIN):
+    def __init__(self, threshold, clear_margin=settings.LOW_SOC_CLEAR_MARGIN, low=False):
         self.threshold = threshold
         self.clear_margin = clear_margin
-        self.low = False
+        # Seeded from alert_state at startup: the Pi loses power when the bank
+        # hits its low-voltage cutoff, and a fresh tracker would re-fire the
+        # alert on every reboot and never clear the earlier one.
+        self.low = low
 
     def update(self, soc):
         """Return 'low', 'recovered' or None."""
@@ -296,6 +301,75 @@ class LowSocTracker:
             self.low = False
             return "recovered"
         return None
+
+
+class SocSourceDetector:
+    """Tells whether the inverters' SOC comes from the battery BMS or from voltage.
+
+    With a working BMS link the inverters report the BMS's SOC, which barely
+    moves when load or charging steps the battery voltage. Without it they
+    fall back to an estimate that is a straight line in voltage (about
+    10 %/V on the 6500EX-48), so every voltage step moves SOC with it.
+
+    Each time the voltage has moved at least MIN_STEP_V from the sample `lag`
+    cycles earlier (about two minutes) on two consecutive cycles, the ratio
+    dSOC/dV is recorded from the second one; waiting a cycle absorbs the
+    inverter updating SOC one cycle after voltage. The median of the last
+    WINDOW ratios decides: at least VOLTAGE_RATIO %/V means a voltage
+    estimate, at most BMS_RATIO means BMS. In between, or with too few steps,
+    the previous state stands. The median ignores the brief false 100 %
+    readings the inverter shows while charging in fallback mode.
+
+    Replayed over 2026-11-12..19 from the Pi: BMS until the link dropped at
+    2026-11-14T03:34Z, flagged as a voltage estimate 20 minutes later, no
+    false switches. See DECISIONS.md (2026-11-19).
+    """
+
+    MIN_STEP_V = 0.3
+    WINDOW = 8
+    VOLTAGE_RATIO = 5.0
+    BMS_RATIO = 2.0
+
+    def __init__(self, source=None, lag=None):
+        self.source = source  # "bms", "voltage" or None (not yet known)
+        self.lag = lag or max(2, round(120 / settings.SAMPLE_INTERVAL))
+        self.history = collections.deque(maxlen=self.lag)
+        self.pending = False
+        self.ratios = collections.deque(maxlen=self.WINDOW)
+
+    def update(self, voltage, soc):
+        """Return 'voltage' or 'bms' when the source changes, else None."""
+        if voltage is None or soc is None:
+            return None
+        if len(self.history) == self.lag:
+            old_v, old_soc = self.history[0]
+            dv = voltage - old_v
+            if abs(dv) < self.MIN_STEP_V:
+                self.pending = False
+            elif not self.pending:
+                # The first sample after a step can still carry the old SOC
+                # (the inverter updates it a cycle late): wait for the next.
+                self.pending = True
+            else:
+                self.ratios.append((soc - old_soc) / dv)
+                self.history.clear()  # count each voltage step once
+                self.pending = False
+        self.history.append((voltage, soc))
+        if len(self.ratios) < self.WINDOW:
+            return None
+        ratio = statistics.median(self.ratios)
+        if ratio >= self.VOLTAGE_RATIO:
+            new = "voltage"
+        elif ratio <= self.BMS_RATIO:
+            new = "bms"
+        else:
+            return None
+        if new == self.source:
+            return None
+        previous, self.source = self.source, new
+        if previous is None and new == "bms":
+            return None  # normal state confirmed after startup; nothing to report
+        return new
 
 
 class GridTracker:
@@ -368,6 +442,17 @@ def dispatch_alert(conn, event_type, message, severity, inverter_id=None):
             alerts.raise_alert(conn, "low_soc", "Battery low", message, "warning", ("battery",))
         elif event_type == "soc_recovered":
             alerts.clear_alert(conn, "low_soc", "Battery recovered", message)
+        elif event_type == "soc_estimated":
+            alerts.raise_alert(
+                conn,
+                "soc_estimate",
+                "Battery SOC is a voltage estimate",
+                message,
+                "warning",
+                ("battery",),
+            )
+        elif event_type == "soc_bms":
+            alerts.clear_alert(conn, "soc_estimate", "Battery SOC from BMS again", message)
     except Exception as exc:  # alerting must never take the collector down
         print(f"Alert dispatch failed: {exc}", flush=True)
 
@@ -398,6 +483,7 @@ class LiveWriter:
             "load_watts": _r(sample["total_load_watts"], 1),
             "battery_voltage": _r(sample["battery_voltage"], 2),
             "battery_soc": _r(sample["battery_soc"], 1),
+            "battery_soc_source": sample.get("battery_soc_source"),
             "battery_watts": _r(sample["battery_watts"], 1),
             "grid_watts": _r(sample["grid_watts"], 1),
             "grid_voltage": _r(sample["grid_voltage"], 1),
@@ -440,7 +526,10 @@ def main():
     live = LiveWriter()
     tracker = StateTracker()
     plant = load_plant_config(conn)
-    soc_tracker = LowSocTracker(float(plant.get("low_soc_alert_percent") or 20))
+    soc_tracker = LowSocTracker(
+        float(plant.get("low_soc_alert_percent") or 20), low=alerts.is_active(conn, "low_soc")
+    )
+    soc_source = SocSourceDetector("voltage" if alerts.is_active(conn, "soc_estimate") else None)
     grid_tracker = GridTracker()
     failures = 0
     lost_reported = False
@@ -520,12 +609,31 @@ def main():
                 pending_events.append(("grid_off", "AC input lost", "info", None))
             system["grid_present"] = grid_tracker.present
 
+            source_change = soc_source.update(system["battery_voltage"], system["battery_soc"])
+            if source_change == "voltage":
+                pending_events.append(
+                    (
+                        "soc_estimated",
+                        "Inverter SOC now follows battery voltage instead of the BMS; "
+                        "check the BMS comms cable and the battery type setting",
+                        "warning",
+                        None,
+                    )
+                )
+            elif source_change == "bms":
+                pending_events.append(
+                    ("soc_bms", "Inverter SOC is coming from the BMS again", "info", None)
+                )
+            system["battery_soc_source"] = soc_source.source
+
             soc_change = soc_tracker.update(system["battery_soc"])
             if soc_change == "low":
                 pending_events.append(
                     (
                         "low_soc",
-                        f"Battery SOC {system['battery_soc']:.0f}% is below {soc_tracker.threshold:.0f}%",
+                        # One decimal: 19.5 rounded to "20% is below 20%" before.
+                        f"Battery SOC {system['battery_soc']:.1f}% is below "
+                        f"{soc_tracker.threshold:.0f}%",
                         "warning",
                         None,
                     )

@@ -611,6 +611,7 @@ __BASE_CSS__
   .bar-track { height: 6px; border-radius: 3px; background: var(--surface-2); margin-top: 10px; overflow: hidden; }
   .bar-fill { height: 100%; width: 0; border-radius: 3px; background: var(--good); transition: width 0.6s ease; }
   .bar-fill.warn { background: var(--warn); } .bar-fill.bad { background: var(--bad); }
+  .tile .sub.estimate { color: var(--warn); }
 
   .inverters { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
   .inv-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
@@ -788,7 +789,12 @@ async function updateDashboard() {
     fill.className = "bar-fill" + (soc < 25 ? " bad" : soc < 40 ? " warn" : "");
     const bw = Number(d.battery_watts);
     const flow = !isNum(d.battery_watts) ? "" : Math.abs(bw) < 25 ? "Idle" : bw > 0 ? "Charging at " + watts(bw) : "Discharging at " + watts(-bw);
-    $("batterySub").textContent = [fmt(d.battery_voltage, 1, " V"), flow].filter(Boolean).join(" · ");
+    // battery_soc_source "voltage": the inverters lost the BMS link and the % is a
+    // straight-line voltage guess that jumps with load (DECISIONS.md 2026-11-19).
+    const estimated = d.battery_soc_source === "voltage";
+    $("batterySoc").title = estimated ? "Voltage estimate: the inverters are not getting SOC from the battery BMS" : "";
+    $("batterySub").textContent = [estimated ? "Voltage estimate" : "", fmt(d.battery_voltage, 1, " V"), flow].filter(Boolean).join(" · ");
+    $("batterySub").classList.toggle("estimate", estimated);
     if (d.grid_present === true) {
       $("grid").textContent = "On";
       $("gridLabel").textContent = fmt(d.grid_voltage, 0, " V") + " at the input";

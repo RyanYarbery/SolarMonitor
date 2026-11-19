@@ -158,7 +158,15 @@ Grid power is not reported by `QPGS` in a trustworthy form, so `grid_watts` is s
 
 ### Events and alerts
 
-Mode changes and fault code transitions per inverter are written to the `events` table, as are telemetry loss (after six consecutive failed reads), recovery, battery SOC dropping below `low_soc_alert_percent` (clearing with 5% hysteresis), and utility or generator AC appearing at the inverter input (at or above 100 V) or disappearing (below 80 V). The dashboard shows the most recent events and a banner when any inverter reports a fault.
+Mode changes and fault code transitions per inverter are written to the `events` table, as are telemetry loss (after six consecutive failed reads), recovery, battery SOC dropping below `low_soc_alert_percent` (clearing with 5% hysteresis), and utility or generator AC appearing at the inverter input (at or above 100 V) or disappearing (below 80 V). The dashboard shows the most recent events and a banner when any inverter reports a fault. The low-battery alert's state is kept in `alert_state`, so a reboot (the Pi loses power when the bank reaches its low-voltage cutoff) neither re-fires it nor leaves the earlier alert open.
+
+### Where the battery SOC comes from
+
+The SOC is whatever the inverters report. With the battery's BMS comms cable connected and the battery type set to lithium, that is the BMS's own figure. Without the link, the 6500EX falls back to a straight line in voltage (about 10% per volt, 45 V reading as 0%). That figure jumps 8 to 15 points whenever load or charging starts or stops, and it is wrong across LiFePO4's flat middle range.
+
+The collector tells the two apart from how SOC moves when the voltage steps. A BMS figure barely moves, and the voltage estimate moves about 10 %/V. When the inverters switch to the estimate, it records a `soc_estimated` event and alert, and the dashboard's battery tile says "Voltage estimate". A `soc_bms` event follows when the link returns. If you see it, check the comms cable between the battery and the inverters' BMS port and the battery type setting (program 05). The inverters' raw figure is always kept per unit in `inverter_samples.battery_soc`.
+
+Counting amp-hours from the inverters' current readings is not used as a substitute. They report whole amps per unit and leave out their own idle draw. Tested against real BMS data, such a counter was 27 points off after one night, and still 13 to 16 points off after tuning (see `DECISIONS.md`).
 
 Set `SOLAR_NTFY_URL` to a topic such as `https://ntfy.sh/your-unguessable-topic` and the same conditions are pushed to your phone through the free [ntfy](https://ntfy.sh) app. To set it up: install the ntfy app, subscribe to a topic name nobody would guess, put the same URL in `/etc/solar-monitor.env`, restart the collector, and confirm with:
 
@@ -247,7 +255,7 @@ Raw samples are deleted only after the aggregator has verified that every affect
 
 `app.py` serves the dashboard on port 5000 by default, with:
 
-- Live tiles for solar, load, battery (SOC bar, voltage, charge or discharge rate) and AC input, with today's and yesterday's energy under each
+- Live tiles for solar, load, battery (SOC bar, voltage, charge or discharge rate, and "Voltage estimate" when the inverters have lost the BMS link) and AC input, with today's and yesterday's energy under each
 - Energy today (completed quarter-hours plus the raw tail, cheap on a Pi 1) and yesterday, today's solar peak and when it happened, lowest SOC, yesterday's performance ratio (the tile says which of `installed_pv_kw`, coordinates, or weather data is missing when it cannot be computed)
 - Battery runtime: hours to empty while discharging or to full while charging, from `battery_capacity_kwh`
 - One compact card per inverter: mode, fault, output, both PV strings, AC output, battery voltage, temperature

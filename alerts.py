@@ -58,6 +58,11 @@ def _state(conn, key):
     return (parse_iso(row[0]), bool(row[1])) if row else (None, False)
 
 
+def is_active(conn, key) -> bool:
+    """True when the alert key is currently raised (survives process restarts)."""
+    return _state(conn, key)[1]
+
+
 def _set_state(conn, key, active, touch=True):
     now = to_iso(now_utc())
     if touch:

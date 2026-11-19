@@ -134,6 +134,10 @@ class CollectorCycleTests(unittest.TestCase):
         self.assertEqual(data["timestamp"], ts)
         self.assertEqual(data["inverters"][1]["pv_quality"], "estimated")
         self.assertFalse(data["any_fault"])
+        self.assertIsNone(data["battery_soc_source"])  # unknown until detected
+        system["battery_soc_source"] = "voltage"
+        writer.write(ts, system, readings)
+        self.assertEqual(json.loads(live_path.read_text())["battery_soc_source"], "voltage")
         settings.LIVE_PATH = settings.LIVE_PATH  # untouched
 
 
@@ -168,6 +172,68 @@ class LowSocTrackerTests(unittest.TestCase):
         self.assertIsNone(t.update(22))  # not yet above threshold + margin
         self.assertEqual(t.update(25), "recovered")
         self.assertIsNone(t.update(None))
+
+    def test_seeded_low_does_not_refire_after_restart(self):
+        t = collector.LowSocTracker(20, clear_margin=5, low=True)
+        self.assertIsNone(t.update(10))
+        self.assertEqual(t.update(26), "recovered")
+
+
+def feed(detector, points, hold=3):
+    """Feed (voltage, soc) pairs, each held for `hold` cycles; return the changes."""
+    changes = []
+    for v, soc in points:
+        for _ in range(hold):
+            change = detector.update(v, soc)
+            if change:
+                changes.append(change)
+    return changes
+
+
+# Load steps of +/-0.6 V. BMS SOC drifts by at most a point; the voltage
+# estimate moves 10 %/V with every step.
+BMS_STEPS = [(53.0 + (0.6 if i % 2 else 0.0), 80.0 - i * 0.1) for i in range(20)]
+VOLTAGE_STEPS = [
+    (53.0 + (0.6 if i % 2 else 0.0), 78.0 + (6.0 if i % 2 else 0.0)) for i in range(20)
+]
+
+
+class SocSourceDetectorTests(unittest.TestCase):
+    def test_bms_on_startup_is_silent(self):
+        d = collector.SocSourceDetector(lag=2)
+        self.assertEqual(feed(d, BMS_STEPS), [])
+        self.assertEqual(d.source, "bms")
+
+    def test_detects_loss_and_return_of_bms(self):
+        d = collector.SocSourceDetector(lag=2)
+        feed(d, BMS_STEPS)
+        self.assertEqual(feed(d, VOLTAGE_STEPS), ["voltage"])
+        self.assertEqual(d.source, "voltage")
+        self.assertEqual(feed(d, BMS_STEPS), ["bms"])
+
+    def test_voltage_estimate_on_startup_is_reported(self):
+        d = collector.SocSourceDetector(lag=2)
+        self.assertEqual(feed(d, VOLTAGE_STEPS), ["voltage"])
+
+    def test_seeded_state_does_not_refire_after_restart(self):
+        d = collector.SocSourceDetector("voltage", lag=2)
+        self.assertEqual(feed(d, VOLTAGE_STEPS), [])
+
+    def test_soc_updating_one_cycle_late_still_reads_as_voltage(self):
+        # The inverter reports the new voltage one cycle before the SOC that
+        # goes with it; the first sample of each step carries the old SOC.
+        d = collector.SocSourceDetector(lag=3)
+        samples = []
+        for v, soc in VOLTAGE_STEPS:
+            stale = samples[-1][1] if samples else soc
+            samples += [(v, stale), (v, soc), (v, soc), (v, soc)]
+        self.assertEqual(feed(d, samples, hold=1), ["voltage"])
+
+    def test_quiet_battery_keeps_state(self):
+        d = collector.SocSourceDetector("voltage", lag=2)
+        self.assertEqual(feed(d, [(52.0, 70.0)] * 50), [])
+        self.assertEqual(d.source, "voltage")
+        self.assertIsNone(d.update(None, 70.0))
 
     def test_per_string_values_recorded(self):
         readings = collector.read_inverters(StubLink())

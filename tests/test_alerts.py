@@ -44,6 +44,14 @@ class AlertCooldownTests(unittest.TestCase):
             alerts.raise_alert(self.conn, "k", "T", "m", cooldown=0)
             self.assertTrue(alerts.raise_alert(self.conn, "k", "T", "m", cooldown=0))
 
+    def test_is_active_follows_raise_and_clear(self):
+        with self.conn:
+            self.assertFalse(alerts.is_active(self.conn, "low_soc"))
+            alerts.raise_alert(self.conn, "low_soc", "T", "m")
+            self.assertTrue(alerts.is_active(self.conn, "low_soc"))
+            alerts.clear_alert(self.conn, "low_soc")
+            self.assertFalse(alerts.is_active(self.conn, "low_soc"))
+
 
 class AlertDisabledTests(unittest.TestCase):
     def test_disabled_when_url_empty(self):
